@@ -1,0 +1,14 @@
+(.json
+.claude
+.mypy_cache
+.vscode
+.venv
+.DS_Store
+__pycache__
+.env
+build
+*.egg-info
+.pytest_cache
+.coverage
+.cache
+*.log
