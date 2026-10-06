@@ -27,3 +27,11 @@ def test_filtros_aceptados_por_la_api(cliente, ds):
 def test_busqueda_de_proveedor_por_nombre(cliente):
     filas = buscar_proveedores(cliente, "seguridad", limite=5)
     assert filas and {"nit", "nombre"} <= set(filas[0])
+
+
+def test_conteo_real_con_q_y_where(cliente):
+    from app_secop import SECOPQuery
+    cont = SECOPQuery(cliente).contar(None, None,
+                                      Filtros(texto="operador logistico", fecha_desde="2025-10-01"))
+    assert set(cont) == {"SECOP II - Contratos", "SECOP II - Procesos", "SECOP Integrado"}
+    assert all(isinstance(n, int) and n >= 0 for n in cont.values())

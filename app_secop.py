@@ -16,6 +16,7 @@ import json
 import socket
 import subprocess
 import threading
+import time
 import webbrowser
 import concurrent.futures
 from datetime import datetime
@@ -26,6 +27,10 @@ from tkinter import (
 
 import pandas as pd
 import requests
+from search import (
+    Filtros, condiciones, orden_dataset, primer_valor_positivo, url_de,
+    construir_where as _build_where, escapar_soql as _escape_sql,
+)
 
 # =============================================================================
 # CONFIGURACION
@@ -164,16 +169,6 @@ def validar_nit(nit):
     return digitos.isdigit() and 8 <= len(digitos) <= 11
 
 
-def _escape_sql(val):
-    """Escapa comillas simples para SoQL."""
-    return str(val).replace("'", "''")
-
-
-def _build_where(conditions):
-    """Une condiciones con AND; retorna string vacio si no hay."""
-    return " AND ".join(conditions) if conditions else ""
-
-
 # =============================================================================
 # CLIENTE API
 # =============================================================================
@@ -187,9 +182,20 @@ class SECOPClient:
 
     def get(self, dataset_id, params=None, timeout=120):
         url = f"{BASE_URL}/{dataset_id}.json"
-        resp = self.session.get(url, params=params, auth=self.auth, timeout=timeout)
-        resp.raise_for_status()
-        return resp.json()
+        for intento in range(3):
+            ultimo = intento == 2
+            try:
+                resp = self.session.get(url, params=params, auth=self.auth, timeout=timeout)
+            except (requests.ConnectionError, requests.Timeout):
+                if ultimo:
+                    raise
+                time.sleep(1.5 * (intento + 1))
+                continue
+            if resp.status_code in (500, 502, 503, 504) and not ultimo:
+                time.sleep(1.5 * (intento + 1))
+                continue
+            resp.raise_for_status()
+            return resp.json()
 
     def get_metadata(self, dataset_id):
         url = f"https://www.datos.gov.co/api/views/{dataset_id}.json"
@@ -205,6 +211,8 @@ class SECOPClient:
 class SECOPQuery:
     def __init__(self, client: SECOPClient):
         self.client = client
+        self.omitidos = []
+        self.ultimos_errores = []
 
     # -------------------------------------------------------------------------
     # AYUDANTE: consulta un dataset con paginacion
@@ -227,106 +235,68 @@ class SECOPQuery:
     # -------------------------------------------------------------------------
     # CONSULTA PAGINADA (lazy loading) — una pagina a la vez
     # -------------------------------------------------------------------------
-    def consultar_pagina(self, nombre, nit=None, unspsc=None,
-                         entidad_nombre=None, entidad_nit=None,
-                         offset=0, page_size=500, on_progress=None):
+    def consultar_pagina(self, nombre, nit=None, filtros=None,
+                         offset=0, page_size=100, on_progress=None):
         """
         Devuelve SOLO la pagina solicitada.
           filas   — lista normalizada (max page_size)
           detalle — dict {nombre_tab: [filas_crudas]} de esta pagina
           errores — lista de strings
           has_more— bool, True si probablemente hay mas paginas
+        `filtros` es un search.Filtros; `nit` (proveedor) tiene prioridad sobre
+        filtros.nit_proveedor. Los datasets que no pueden aplicar algun filtro
+        activo se omiten y quedan en self.omitidos.
         """
         filas = []
         detalle = {}
         errores = []
+        omitidos = []
         has_more = False
 
-        # Si es busqueda general (sin NIT de proveedor), usar page_size menor
-        # y $q (full-text search) que es mucho mas rapido que LIKE
-        es_busqueda_general = not nit
-        if es_busqueda_general:
-            page_size = min(page_size, 50)
+        f = (filtros or Filtros()).limpio()
+        if nit:
+            f.nit_proveedor = str(nit).strip()
 
-        # --- Funciones para paralelizar las 3 consultas principales ---
-        def _fetch_contratos():
-            conds = []
-            q_text = None
-            if nit:
-                conds.append(f"documento_proveedor='{_escape_sql(nit)}'")
-            if unspsc:
-                conds.append(f"codigo_de_categoria_principal LIKE '%{_escape_sql(unspsc)}%'")
-            if entidad_nit:
-                conds.append(f"nit_entidad='{_escape_sql(entidad_nit)}'")
-            # Si es busqueda general y hay nombre de entidad, usar $q (full-text)
-            # que es MUCHO mas rapido que LIKE sobre millones de registros
-            if es_busqueda_general and entidad_nombre:
-                q_text = entidad_nombre
-            elif entidad_nombre:
-                conds.append(f"nombre_entidad LIKE '%{_escape_sql(entidad_nombre)}%'")
+        def _fetch(dataset_id):
+            r = condiciones(dataset_id, f)
+            if r is None:
+                omitidos.append(DATASETS[dataset_id])
+                return []
+            conds, q_text = r
+            return self._fetch_dataset(dataset_id, conds, orden_dataset(dataset_id, f),
+                                       page_size, offset, q_text=q_text)
 
-            return self._fetch_dataset("jbjy-vk9h", conds, "fecha_de_firma DESC", page_size, offset, q_text=q_text)
-
-        def _fetch_procesos():
-            conds = []
-            q_text = None
-            if nit:
-                conds.append(f"nit_del_proveedor_adjudicado='{_escape_sql(nit)}'")
-            if unspsc:
-                conds.append(f"codigo_principal_de_categoria LIKE '%{_escape_sql(unspsc)}%'")
-            if entidad_nit:
-                conds.append(f"nit_entidad='{_escape_sql(entidad_nit)}'")
-            if es_busqueda_general and entidad_nombre:
-                q_text = entidad_nombre
-            elif entidad_nombre:
-                conds.append(f"entidad LIKE '%{_escape_sql(entidad_nombre)}%'")
-
-            return self._fetch_dataset("p6dx-8zbt", conds, "fecha_adjudicacion DESC", page_size, offset, q_text=q_text)
-
-        def _fetch_integrado():
-            conds = []
-            q_text = None
-            if nit:
-                conds.append(f"documento_proveedor='{_escape_sql(nit)}'")
-            if entidad_nit:
-                conds.append(f"nit_de_la_entidad='{_escape_sql(entidad_nit)}'")
-            if es_busqueda_general and entidad_nombre:
-                q_text = entidad_nombre
-            elif entidad_nombre:
-                conds.append(f"nombre_de_la_entidad LIKE '%{_escape_sql(entidad_nombre)}%'")
-
-            return self._fetch_dataset("rpmr-utcd", conds, "fecha_de_firma_del_contrato DESC", page_size, offset, q_text=q_text)
-
-        # --- Paralelizar las 3 consultas principales ---
         if on_progress:
             on_progress(f"{nombre or 'Busqueda'}: consultando datasets (offset {offset})...")
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                future_contratos = executor.submit(_fetch_contratos)
-                future_procesos = executor.submit(_fetch_procesos)
-                future_integrado = executor.submit(_fetch_integrado)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                future_contratos = executor.submit(_fetch, "jbjy-vk9h")
+                future_procesos = executor.submit(_fetch, "p6dx-8zbt")
+                future_integrado = executor.submit(_fetch, "rpmr-utcd")
 
                 data_contratos = future_contratos.result(timeout=180)
                 data_procesos = future_procesos.result(timeout=180)
                 data_integrado = future_integrado.result(timeout=180)
         except Exception as e:
             errores.append(f"Error en consulta paralela: {e}. Intentando secuencial...")
+            omitidos.clear()
             # Fallback secuencial
             try:
-                data_contratos = _fetch_contratos()
+                data_contratos = _fetch("jbjy-vk9h")
             except Exception as e2:
                 errores.append(f"Contratos fallback: {e2}")
                 data_contratos = []
             try:
-                data_procesos = _fetch_procesos()
+                data_procesos = _fetch("p6dx-8zbt")
             except Exception as e2:
                 errores.append(f"Procesos fallback: {e2}")
                 data_procesos = []
             try:
-                data_integrado = _fetch_integrado()
+                data_integrado = _fetch("rpmr-utcd")
             except Exception as e2:
                 errores.append(f"Integrado fallback: {e2}")
                 data_integrado = []
+        self.omitidos = sorted(set(omitidos))
 
         # Procesar Contratos
         if data_contratos:
@@ -342,7 +312,7 @@ class SECOPQuery:
                 "entidad_nit": r.get("nit_entidad", ""),
                 "id_contrato": contract_id,
                 "referencia":  r.get("referencia_del_contrato", ""),
-                "objeto":    r.get("objeto_del_contrato_a_ejecutar", "")[:80],
+                "objeto":    r.get("objeto_del_contrato") or r.get("objeto_del_contrato_a_ejecutar") or "",
                 "valor":     formatear_pesos(r.get("valor_del_contrato_con_adiciones") or r.get("valor_del_contrato", "")),
                 "pagado":    formatear_pesos(r.get("valor_pagado", "")),
                 "pendiente": formatear_pesos(r.get("valor_pendiente_de_pago", "")),
@@ -366,15 +336,16 @@ class SECOPQuery:
                 "entidad_nit": r.get("nit_entidad", ""),
                 "id_contrato": r.get("id_del_proceso", ""),
                 "referencia":  r.get("referencia_del_proceso", ""),
-                "objeto":    r.get("nombre_del_procedimiento", "")[:80],
-                "valor":     formatear_pesos(r.get("valor_total_adjudicacion", "")),
+                "objeto":    r.get("nombre_del_procedimiento", ""),
+                "valor":     formatear_pesos(primer_valor_positivo(
+                    r.get("valor_total_adjudicacion"), r.get("precio_base"))),
                 "pagado":    "",
                 "pendiente": "",
                 "estado":    r.get("estado_del_procedimiento", ""),
                 "fecha_firma": formatear_fecha(r.get("fecha_adjudicacion", "")),
                 "fecha_fin":   "",
                 "sancion":   "No",
-                "url":       "",
+                "url":       url_de(r.get("urlproceso")),
             })
 
         # Procesar Integrado
@@ -390,7 +361,7 @@ class SECOPQuery:
                 "entidad_nit": r.get("nit_de_la_entidad", ""),
                 "id_contrato": r.get("numero_del_contrato", ""),
                 "referencia":  r.get("numero_del_contrato", ""),
-                "objeto":    r.get("objeto_del_contrato", "")[:80],
+                "objeto":    r.get("objeto_a_contratar") or r.get("objeto_del_proceso") or r.get("objeto_del_contrato") or "",
                 "valor":     formatear_pesos(r.get("valor_contrato", "")),
                 "pagado":    "",
                 "pendiente": "",
@@ -398,7 +369,7 @@ class SECOPQuery:
                 "fecha_firma": formatear_fecha(r.get("fecha_de_firma_del_contrato", "")),
                 "fecha_fin":   formatear_fecha(r.get("fecha_fin_ejecuci_n", "")),
                 "sancion":   "No",
-                "url":       "",
+                "url":       url_de(r.get("url_contrato")),
             })
 
         # --- Proveedores (qmzu-gj57) — solo pagina 1 y si hay NIT ---
@@ -431,7 +402,7 @@ class SECOPQuery:
                             "entidad_nit": "",
                             "id_contrato": "",
                             "referencia":  r.get("tipo_de_sancion", ""),
-                            "objeto":    r.get("descripcion", "")[:80],
+                            "objeto":    r.get("descripcion", ""),
                             "valor":     formatear_pesos(r.get("valor", "")),
                             "pagado":    formatear_pesos(r.get("valor_pagado", "")),
                             "pendiente": "",
@@ -492,7 +463,7 @@ class SECOPQuery:
                         "entidad_nit": "",
                         "id_contrato": "",
                         "referencia":  r.get("tipo_inhabilidad", ""),
-                        "objeto":    r.get("sanciones", "")[:80],
+                        "objeto":    r.get("sanciones", ""),
                         "valor":     "",
                         "pagado":    "",
                         "pendiente": "",
@@ -528,56 +499,52 @@ class SECOPQuery:
         return filas, detalle, errores, has_more
 
     # -------------------------------------------------------------------------
-    # CONSULTA COMPLETA (para exportar) — descarga TODO en bloques
+    # CONTEO E ITERACION PAGINA A PAGINA (para exportar)
     # -------------------------------------------------------------------------
-    def consultar_completo(self, nombre, nit=None, unspsc=None,
-                           entidad_nombre=None, entidad_nit=None,
-                           on_progress=None, page_size=500):
-        """
-        Descarga TODOS los datos paginando internamente.
-        Devuelve: filas, detalle, errores
-        """
-        todas_filas = []
-        todo_detalle = {}
-        errores = []
-        offset = 0
-        pagina = 1
+    def contar(self, nombre, nit=None, filtros=None):
+        """Total real por dataset (count(*)) con los mismos filtros. Los errores se propagan."""
+        f = (filtros or Filtros()).limpio()
+        if nit:
+            f.nit_proveedor = str(nit).strip()
+        total = {}
+        for ds in ("jbjy-vk9h", "p6dx-8zbt", "rpmr-utcd"):
+            r = condiciones(ds, f)
+            if r is None:                          # el dataset no soporta algun filtro activo
+                total[DATASETS[ds]] = 0
+                continue
+            conds, q_text = r
+            params = {"$select": "count(*)"}
+            if q_text:
+                params["$q"] = q_text
+            where = _build_where(conds)
+            if where:
+                params["$where"] = where
+            datos = self.client.get(ds, params, timeout=60)
+            total[DATASETS[ds]] = int(datos[0].get("count", 0)) if datos else 0
+        return total
 
-        while True:
+    def iterar_paginas(self, nombre, nit=None, filtros=None, page_size=100,
+                       on_progress=None, cancelado=None, max_paginas=100000):
+        """Genera (filas, detalle) pagina a pagina SIN acumular. Los errores de cada
+        pagina quedan en self.ultimos_errores. Se detiene si cancelado() es True."""
+        self.ultimos_errores = []
+        offset, pagina = 0, 1
+        while pagina <= max_paginas:
+            if cancelado and cancelado():
+                return
             if on_progress:
                 on_progress(f"Descargando pagina {pagina} (offset {offset})...")
-
             filas, detalle, errs, has_more = self.consultar_pagina(
-                nombre, nit, unspsc, entidad_nombre, entidad_nit,
-                offset=offset, page_size=page_size
-            )
-            errores.extend(errs)
-            todas_filas.extend(filas)
-
-            # Acumular detalle (datos crudos)
-            for k, v in detalle.items():
-                if k not in todo_detalle:
-                    todo_detalle[k] = []
-                todo_detalle[k].extend(v)
-
-            # Si no hay mas datos o la pagina vino vacia o sin contratos, parar
+                nombre, nit, filtros, offset=offset, page_size=page_size)
+            self.ultimos_errores.extend(errs)
+            filas = [f for f in filas if f.get("fuente") != "—"]   # sin la fila de relleno
+            if not filas and not detalle:
+                return
+            yield filas, detalle
             if not has_more:
-                break
-            # Safety: si la pagina devolvio 0 registros o solo SIN CONTRATOS
-            if not filas or (len(filas) == 1 and filas[0].get("estado") == "SIN CONTRATOS"):
-                break
-            # Safety: max 20 paginas (10k registros) para evitar bucle infinito
-            if pagina >= 20:
-                errores.append("Limite de 20 paginas alcanzado. Puede haber mas datos.")
-                break
-
+                return
             offset += page_size
             pagina += 1
-
-        if on_progress:
-            on_progress(f"Descarga completa: {len(todas_filas)} registros.")
-
-        return todas_filas, todo_detalle, errores
 
 
 # =============================================================================
@@ -622,6 +589,7 @@ class AppSECOP(Tk):
         self._filas = []
         self._url_map = {}
         self._errores = []
+        self._omitidos = []
         self._consultando = False
         self._detalle_cache = {}
 
@@ -1228,15 +1196,19 @@ class AppSECOP(Tk):
         else:
             empresas = {None: None}  # Busqueda general
 
-        # Guardar filtros activos para navegacion lazy
-        self._filtros_activos = {
-            "empresas": empresas,
-            "unspsc": unspsc or None,
-            "entidad_nombre": entidad_nombre or None,
-            "entidad_nit": entidad_nit or None,
-        }
+        filtros = Filtros(
+            nit_proveedor=nit_manual or (self.empresas.get(empresa_sel, "") if empresa_sel != "TODAS" else ""),
+            unspsc=unspsc, entidad_nombre=entidad_nombre, entidad_nit=entidad_nit,
+        )
+        errs_filtros = filtros.errores()
+        if errs_filtros:
+            messagebox.showwarning("Filtros invalidos", "\n".join(errs_filtros))
+            return
 
-        self._limpiar_tabla()
+        self._limpiar_tabla()                       # deja _filtros_activos en None
+        # Guardar filtros activos para navegacion lazy. Se asigna DESPUES de limpiar: antes
+        # se asignaban y _limpiar_tabla() los borraba enseguida (defecto que se fija en la Tarea 7).
+        self._filtros_activos = {"empresas": empresas, "filtros": filtros}
         self._errores = []
         self._pagina_actual = 1
         self._total_estimado = 0
@@ -1245,11 +1217,11 @@ class AppSECOP(Tk):
 
         threading.Thread(
             target=self._hilo_consulta,
-            args=(empresas, unspsc, entidad_nombre, entidad_nit, 0),
+            args=(empresas, filtros, 0),
             daemon=True,
         ).start()
 
-    def _hilo_consulta(self, empresas, unspsc, entidad_nombre, entidad_nit, offset):
+    def _hilo_consulta(self, empresas, filtros, offset):
         """Consulta UNA pagina (lazy loading) usando un cliente local para evitar problemas de hilos."""
         # Cliente local para este hilo (requests.Session no es thread-safe)
         client_local = SECOPClient(self.creds)
@@ -1266,9 +1238,7 @@ class AppSECOP(Tk):
             f, d, e, has_more = query_local.consultar_pagina(
                 nombre=nombre,
                 nit=nit,
-                unspsc=unspsc or None,
-                entidad_nombre=entidad_nombre or None,
-                entidad_nit=entidad_nit or None,
+                filtros=filtros,
                 offset=offset,
                 page_size=self._filas_por_pagina,
                 on_progress=lambda msg: self.after(0, lambda m=msg: self.lbl_estado.config(text=m))
@@ -1296,13 +1266,14 @@ class AppSECOP(Tk):
                     nuevas_empresas.append((nombre_a_guardar, nit))
 
         # Guardar entidad en historial (solo en primera pagina)
-        if offset == 0 and (entidad_nombre or entidad_nit):
-            ent_key = entidad_nombre if entidad_nombre else entidad_nit
-            ent_nit = entidad_nit if entidad_nit else ""
+        if offset == 0 and (filtros.entidad_nombre or filtros.entidad_nit):
+            ent_key = filtros.entidad_nombre if filtros.entidad_nombre else filtros.entidad_nit
+            ent_nit = filtros.entidad_nit if filtros.entidad_nit else ""
             if ent_key and ent_key not in self.entidades:
                 if filas and any(row.get("estado") != "SIN CONTRATOS" for row in filas):
                     nuevas_entidades.append((ent_key, ent_nit))
 
+        self._omitidos = list(query_local.omitidos)
         self.after(0, lambda: self._mostrar_resultados_pagina(
             filas, detalle, errores, has_more_global, offset,
             nuevas_empresas, nuevas_entidades))
@@ -1355,6 +1326,8 @@ class AppSECOP(Tk):
             msg += f"  |  ATENCION: {sanciones} sanciones/inhabilidades"
         if self._errores:
             msg += f"  |  {len(self._errores)} errores"
+        if self._omitidos:
+            msg += "  |  Omitidos (filtro no soportado): " + ", ".join(self._omitidos)
         self.lbl_estado.config(text=msg)
 
         if offset == 0 and self._errores:
@@ -1496,8 +1469,7 @@ class AppSECOP(Tk):
 
         threading.Thread(
             target=self._hilo_consulta,
-            args=(filtros["empresas"], filtros["unspsc"],
-                  filtros["entidad_nombre"], filtros["entidad_nit"], offset),
+            args=(filtros["empresas"], filtros["filtros"], offset),
             daemon=True,
         ).start()
 
@@ -1693,29 +1665,16 @@ class AppSECOP(Tk):
             ))
 
     def _hilo_exportar_datos(self, filtros):
-        """Descarga TODOS los datos para exportar. Retorna (filas, detalle)."""
-        # Cliente local para este hilo
-        client_local = SECOPClient(self.creds)
-        query_local = SECOPQuery(client_local)
-
-        todas_filas = []
-        todo_detalle = {}
-        empresas = filtros["empresas"]
-
-        for nombre, nit in empresas.items():
-            filas, detalle, errores = query_local.consultar_completo(
-                nombre=nombre,
-                nit=nit,
-                unspsc=filtros["unspsc"],
-                entidad_nombre=filtros["entidad_nombre"],
-                entidad_nit=filtros["entidad_nit"],
-                on_progress=lambda msg: self.after(0, lambda m=msg: self.lbl_estado.config(text=m))
-            )
-            todas_filas.extend(filas)
-            for k, v in detalle.items():
-                if k not in todo_detalle:
-                    todo_detalle[k] = []
-                todo_detalle[k].extend(v)
+        """PUENTE TEMPORAL: junta las paginas en memoria hasta que la Tarea 8 exporte a disco."""
+        query_local = SECOPQuery(SECOPClient(self.creds))
+        todas_filas, todo_detalle = [], {}
+        for nombre, nit in filtros["empresas"].items():
+            for filas, detalle in query_local.iterar_paginas(
+                    nombre, nit, filtros["filtros"], page_size=500,
+                    on_progress=lambda msg: self.after(0, lambda m=msg: self.lbl_estado.config(text=m))):
+                todas_filas.extend(filas)
+                for k, v in detalle.items():
+                    todo_detalle.setdefault(k, []).extend(v)
         return todas_filas, todo_detalle
 
     def _set_exportando(self, activo):
