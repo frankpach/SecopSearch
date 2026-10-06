@@ -208,3 +208,132 @@ def test_cancelar_despues_de_que_el_hilo_termina_tambien_descarta(activa, monkey
     activa._cancelar_operacion()                    # llega antes de que la UI procese el after
     activa.update()
     assert recibidos == []
+
+
+# ---- correcciones de la revision ------------------------------------------------
+
+@pytest.fixture
+def con_conteo(app, monkeypatch):
+    """Como `activa`, pero con el conteo real (sus hilos se registran en HiloFalso)."""
+    HiloFalso.lanzados = []
+    monkeypatch.setattr(app_secop.threading, "Thread", HiloFalso)
+    app._filtros_activos = {"empresas": {None: None}, "filtros": Filtros(texto="x")}
+    app._filas_por_pagina = 100
+    return app
+
+
+def _conteos_lanzados(a):
+    return [args for target, args in HiloFalso.lanzados if target == a._hilo_contar]
+
+
+def test_un_conteo_que_llega_despues_de_limpiar_se_descarta(con_conteo):
+    a = con_conteo
+    a._pagina_actual = 1
+    a._mostrar_resultados_pagina(_filas(1), {}, [], True, 0, [], [])
+    token = _conteos_lanzados(a)[-1][2]
+    a._limpiar_tabla()
+    a._aplicar_conteos({"SECOP II - Contratos": 900}, token)
+    assert a._total_paginas is None and a._conteos is None
+    assert a._pag_frm.winfo_manager() == ""                 # la barra sigue oculta
+
+
+def test_cancelar_un_cambio_de_tamano_restaura_tamano_pagina_y_cache(activa):
+    for p in (1, 2, 3):
+        activa._pagina_actual = p
+        activa._mostrar_resultados_pagina(_filas(1, p), {}, [], True, (p - 1) * 100, [], [])
+    activa._aplicar_conteos({"SECOP II - Contratos": 250}, activa._consulta_id)
+    activa.var_tamano.set("50")
+    activa._on_tamano()
+    assert activa._consultando is True
+    activa._cancelar_operacion()
+    assert activa._filas_por_pagina == 100 and activa.var_tamano.get() == "100"
+    assert activa._pagina_actual == 3 and activa._total_paginas == 3
+    assert activa._cache.obtener(2) is not None              # las paginas a 100 siguen validas
+    assert "Pagina 3 de 3" in activa.lbl_pag.cget("text")
+
+
+def test_cancelar_una_pagina_no_pierde_el_total(con_conteo):
+    a = con_conteo
+    a._pagina_actual = 1
+    a._mostrar_resultados_pagina(_filas(1), {}, [], True, 0, [], [])
+    primero = _conteos_lanzados(a)[-1][2]
+    a._cambiar_pagina(2)
+    a._cancelar_operacion()
+    a._aplicar_conteos({"SECOP II - Contratos": 450}, primero)   # el conteo viejo se descarta
+    ultimo = _conteos_lanzados(a)[-1][2]
+    a._aplicar_conteos({"SECOP II - Contratos": 450}, ultimo)    # ...pero se relanzo uno vigente
+    assert a._total_paginas == 5
+
+
+def test_pagina_1_desde_cache_no_lanza_un_segundo_conteo(con_conteo):
+    a = con_conteo
+    a._pagina_actual = 1
+    a._mostrar_resultados_pagina(_filas(1), {}, [], True, 0, [], [])
+    a._pagina_actual = 2
+    a._mostrar_resultados_pagina(_filas(1, 100), {}, [], True, 100, [], [])
+    a._cambiar_pagina(1)                                         # cache, con el conteo en curso
+    assert len(_conteos_lanzados(a)) == 1
+
+
+def test_un_conteo_fallido_permite_reintentar(con_conteo, monkeypatch):
+    a = con_conteo
+
+    class QueryRota:
+        def __init__(self, client):
+            pass
+
+        def contar(self, *a, **k):
+            raise RuntimeError("sin red")
+    monkeypatch.setattr(app_secop, "SECOPQuery", QueryRota)
+    a._iniciar_conteo()
+    target, args = HiloFalso.lanzados[-1]
+    target(*args)                                   # el hilo del conteo, sin hilo real
+    a.update()
+    assert a._contando is None and a._conteos is None
+    a._iniciar_conteo()                             # fallido: se puede volver a intentar
+    assert len(_conteos_lanzados(a)) == 2
+
+
+def test_pagina_con_errores_no_se_cachea_y_la_cache_no_arrastra_errores(activa):
+    activa._pagina_actual = 1
+    activa._mostrar_resultados_pagina(_filas(1), {}, [], True, 0, [], [])
+    activa._pagina_actual = 2
+    activa._mostrar_resultados_pagina(_filas(1, 100), {}, ["fallo X"], True, 100, [], [])
+    assert activa._cache.obtener(2) is None
+    activa._cambiar_pagina(1)
+    assert activa._errores == [] and "errores" not in activa.lbl_estado.cget("text")
+
+
+class QueryQueFalla:
+    def __init__(self, client):
+        self.omitidos = []
+
+    def consultar_pagina(self, *a, **k):
+        raise RuntimeError("boom")
+
+
+def test_excepcion_en_el_hilo_termina_la_consulta_y_la_informa(activa, monkeypatch):
+    monkeypatch.setattr(app_secop, "SECOPQuery", QueryQueFalla)
+    activa._pagina_actual = 1
+    activa._mostrar_resultados_pagina(_filas(1), {}, [], True, 0, [], [])
+    activa._cambiar_pagina(2)
+    assert activa._consultando is True
+    activa._hilo_consulta({None: None}, Filtros(texto="x"), 100, activa._consulta_id)
+    activa.update()
+    assert activa._consultando is False and activa._pagina_actual == 1
+    assert "boom" in activa.lbl_estado.cget("text")
+
+
+def test_excepcion_de_una_consulta_cancelada_no_toca_la_ui(activa, monkeypatch):
+    monkeypatch.setattr(app_secop, "SECOPQuery", QueryQueFalla)
+    activa._hilo_consulta({None: None}, Filtros(texto="x"), 0, activa._consulta_id - 1)
+    activa.update()
+    assert "boom" not in activa.lbl_estado.cget("text")
+
+
+def test_la_barra_no_cuenta_la_fila_de_relleno(activa):
+    relleno = _filas(1)
+    relleno[0]["fuente"] = "—"
+    activa._pagina_actual = 1
+    activa._mostrar_resultados_pagina(relleno, {}, [], False, 0, [], [])
+    assert activa.lbl_pag.cget("text").endswith("0 filas")

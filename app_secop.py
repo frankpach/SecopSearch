@@ -606,6 +606,8 @@ class AppSECOP(Tk):
         self._pagina_detalle = {}      # detalle crudo SOLO de la pagina actual
         self._consulta_id = 0          # descarta resultados de consultas canceladas o viejas
         self._cancelar = threading.Event()
+        self._contando = None          # _consulta_id del conteo en curso (evita duplicarlo)
+        self._tamano_previo = None     # (tamano, cache) para deshacer un cambio de tamano cancelado
         self._filtros_activos = None   # dict con filtros para reconsultar paginas
         self._orden_inverso = {}       # estado de ordenamiento por columna
 
@@ -1256,7 +1258,21 @@ class AppSECOP(Tk):
     def _hilo_consulta(self, empresas, filtros, offset, token):
         """Consulta UNA pagina (lazy loading) usando un cliente local para evitar problemas de hilos.
         `token` es el _consulta_id con que se lanzo: si cambio (cancelada o reemplazada), el
-        resultado se descarta sin tocar la UI."""
+        resultado se descarta sin tocar la UI. Una excepcion termina la consulta y se informa."""
+        try:
+            self._consultar_pagina_en_hilo(empresas, filtros, offset, token)
+        except Exception as e:
+            # `e` deja de existir al salir del except: el mensaje se calcula aqui
+            msg = str(e) or type(e).__name__
+            self.after(0, lambda m=msg: self._fallo_consulta(m, token))
+
+    def _fallo_consulta(self, msg, token):
+        if token != self._consulta_id:
+            return
+        self._restaurar_estado_previo()
+        self.lbl_estado.config(text=f"Error en la consulta: {msg}")
+
+    def _consultar_pagina_en_hilo(self, empresas, filtros, offset, token):
         # Cliente local para este hilo (requests.Session no es thread-safe)
         client_local = SECOPClient(self.creds)
         query_local = SECOPQuery(client_local)
@@ -1335,13 +1351,16 @@ class AppSECOP(Tk):
         self._pagina_detalle = detalle          # solo la pagina actual; no se acumula
         if omitidos is not None:                # None: pagina servida desde la cache
             self._omitidos = omitidos
+        self._tamano_previo = None              # un cambio de tamano ya no se puede deshacer
 
         # Actualizar historiales
         if nuevas_empresas or nuevas_entidades:
             self._actualizar_historiales(nuevas_empresas, nuevas_entidades)
 
-        # Las ultimas paginas se guardan para revisitarlas sin consultar la API
-        self._cache.guardar(self._pagina_actual, (filas, detalle, [], has_more))
+        # Las ultimas paginas se guardan para revisitarlas sin consultar la API; una pagina
+        # con errores puede estar incompleta: no se guarda y se vuelve a pedir al revisitarla
+        if not errores:
+            self._cache.guardar(self._pagina_actual, (filas, detalle, [], has_more))
 
         # Renderizar pagina
         self._filas = filas  # Solo la pagina actual en memoria de UI
@@ -1493,6 +1512,7 @@ class AppSECOP(Tk):
         en_cache = self._cache.obtener(pagina)
         if en_cache is not None:
             filas, detalle, _errores, has_more = en_cache
+            self._errores = []                  # los de otra pagina no aplican a esta
             self._mostrar_resultados_pagina(filas, detalle, [], has_more, offset, [], [])
             return
         self._errores = []
@@ -1522,11 +1542,14 @@ class AppSECOP(Tk):
         nuevo = int(self.var_tamano.get())
         if nuevo == self._filas_por_pagina:
             return
+        recargar = bool(self._filtros_activos and not self._consultando)
+        # Si la recarga se cancela o falla se vuelve al tamano, la pagina y la cache anteriores
+        self._tamano_previo = (self._filas_por_pagina, self._cache) if recargar else None
         self._filas_por_pagina = nuevo
-        self._cache.vaciar()
+        self._cache = CachePaginas()
         if self._conteos:
             self._total_paginas = total_paginas(self._conteos, nuevo)
-        if self._filtros_activos and not self._consultando:
+        if recargar:
             self._cambiar_pagina(1, forzar=True)
 
     def _actualizar_barra_paginacion(self):
@@ -1541,8 +1564,9 @@ class AppSECOP(Tk):
             pos = f"{pag} de {total} (≈{aprox} registros)"
         else:
             pos = f"{pag}{'+' if self._has_more else ''}"
+        reales = sum(1 for f in self._filas if f.get("fuente") != "—")   # sin la fila de relleno
         self.lbl_pag.config(
-            text=f"Pagina {pos}  |  hasta {self._filas_por_pagina} por dataset  |  {len(self._filas)} filas")
+            text=f"Pagina {pos}  |  hasta {self._filas_por_pagina} por dataset  |  {reales} filas")
         self.btn_first.config(state="normal" if pag > 1 else "disabled")
         self.btn_prev.config(state="normal" if pag > 1 else "disabled")
         self.btn_next.config(state="normal" if hay_siguiente else "disabled")
@@ -1550,6 +1574,9 @@ class AppSECOP(Tk):
 
     # ---- total real en segundo plano -------------------------------------
     def _iniciar_conteo(self):
+        if self._contando == self._consulta_id:     # ya hay un conteo en curso para esta consulta
+            return
+        self._contando = self._consulta_id
         f = self._filtros_activos
         threading.Thread(target=self._hilo_contar,
                          args=(f["empresas"], f["filtros"], self._consulta_id),
@@ -1563,11 +1590,14 @@ class AppSECOP(Tk):
                 for ds, n in query.contar(nombre, nit, filtros).items():
                     total[ds] = total.get(ds, 0) + n
         except Exception:
-            return                     # sin total: se conserva la paginacion "estimada" (N+)
+            total = None               # sin total: se conserva la paginacion "estimada" (N+)
         self.after(0, lambda: self._aplicar_conteos(total, token))
 
     def _aplicar_conteos(self, conteos, token):
-        if token != self._consulta_id:
+        """conteos=None: el conteo fallo (se podra reintentar)."""
+        if token == self._contando:
+            self._contando = None
+        if token != self._consulta_id or conteos is None or not self._filtros_activos:
             return
         self._conteos = conteos
         self._total_paginas = total_paginas(conteos, self._filas_por_pagina)
@@ -1597,12 +1627,27 @@ class AppSECOP(Tk):
         self._consulta_id += 1         # lo que llegue de una consulta en vuelo se descarta
         self._cancelar.set()           # las exportaciones largas revisan este evento
         if self._consultando:
-            if self._pagina_previa:
-                self._pagina_actual = self._pagina_previa
-            if not self._filas:
-                self._filtros_activos = None
-            self._set_consultando(False)
+            self._restaurar_estado_previo()
         self.lbl_estado.config(text="Operacion cancelada.")
+        # Un conteo en vuelo llevaba el token anterior y se descartara: se relanza con el nuevo
+        if self._filtros_activos and self._conteos is None:
+            self._iniciar_conteo()
+
+    def _restaurar_estado_previo(self):
+        """Deshace el cambio de pagina (y de tamano) de una carga cancelada o fallida."""
+        if self._pagina_previa:
+            self._pagina_actual = self._pagina_previa
+        if self._tamano_previo:
+            self._filas_por_pagina, self._cache = self._tamano_previo
+            self.var_tamano.set(str(self._filas_por_pagina))
+            if self._conteos:
+                self._total_paginas = total_paginas(self._conteos, self._filas_por_pagina)
+        self._tamano_previo = None
+        if not self._filas:
+            self._filtros_activos = None
+        self._set_consultando(False)
+        if self._filtros_activos:
+            self._actualizar_barra_paginacion()
 
     def _ordenar(self, col):
         # En lazy loading solo se ordena la pagina visible, por tipo real
@@ -1809,6 +1854,9 @@ class AppSECOP(Tk):
         self._cache.vaciar()
         self._conteos = None
         self._total_paginas = None
+        self._consulta_id += 1         # un conteo o una pagina en vuelo ya no aplican
+        self._contando = None
+        self._tamano_previo = None
         self._pagina_actual = 1
         self._has_more = False
         self._filtros_activos = None
