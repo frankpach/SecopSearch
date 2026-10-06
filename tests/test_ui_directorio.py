@@ -546,3 +546,108 @@ def test_aviso_de_migracion_fallida_no_borra_el_aviso_previo(legado, monkeypatch
         a.destroy()
         del a
         gc.collect()
+
+
+# ---- revision final: nombre visible vs criterio, NIT canonico, nombre automatico ------
+
+def _capturar_hilos(monkeypatch):
+    lanzados = []
+    monkeypatch.setattr("app_secop.threading.Thread",
+                        lambda target=None, args=(), daemon=None, **k:
+                        type("H", (), {"start": lambda s: lanzados.append(args)})())
+    return lanzados
+
+
+def test_elegir_entidad_del_combo_filtra_por_su_nit_sin_usar_el_nombre(app, monkeypatch):
+    e = app.directorio.agregar("entidades", "Alcaldia Medellin (cliente VIP)", "890905211")
+    app._refrescar_combos()
+    app.var_entidad.set("Alcaldia Medellin (cliente VIP)")
+    app._on_entidad_selected()
+    assert app.entry_entidad_nombre.get() == "" and app.entry_entidad_nit.get() == "890905211"
+    f = app._leer_filtros()
+    assert f.entidad_nombre == "" and f.entidad_nit == "890905211"
+    app._poner(app.entry_entidad_nit, "")                  # sin evento: el combo basta
+    f = app._leer_filtros()
+    assert f.entidad_nombre == "" and f.entidad_nit == "890905211"
+    assert e["id"]
+
+
+def test_entidad_sin_nit_usa_el_nombre_del_registro_no_la_clave_del_combo(app):
+    app.directorio.agregar("entidades", "Alcaldia", "")
+    app.directorio.agregar("entidades", "Alcaldia", "800000001")   # clave "Alcaldia (800000001)"
+    app._refrescar_combos()
+    app.var_entidad.set("Alcaldia (800000001)")
+    app._on_entidad_selected()
+    f = app._leer_filtros()
+    assert f.entidad_nombre == "" and f.entidad_nit == "800000001"
+    app.var_entidad.set("Alcaldia")
+    app._poner(app.entry_entidad_nit, "")
+    app._on_entidad_selected()
+    assert app._leer_filtros().entidad_nombre == "Alcaldia"
+
+
+def test_empresa_del_combo_consulta_sanciones_con_el_nombre_oficial_no_con_la_clave(app, monkeypatch):
+    lanzados = _capturar_hilos(monkeypatch)
+    app.directorio.agregar("empresas", "ACME", "111111111")
+    app.directorio.agregar("empresas", "ACME", "222222222", nombre_auto=True)  # "ACME (222222222)"
+    app._refrescar_combos()
+    app.var_empresa.set("ACME (222222222)")
+    app._iniciar_consulta()
+    assert lanzados[-1][0] == {"ACME": "222222222"}
+
+
+def test_empresa_con_nombre_pendiente_consulta_sanciones_por_nit(app, monkeypatch):
+    lanzados = _capturar_hilos(monkeypatch)
+    e = app.directorio.agregar("empresas", "ACME SAS", "900123456", nombre_auto=True)
+    app.directorio.actualizar("empresas", e["id"], nit="800111222")    # nombre viejo: invalido
+    app._refrescar_combos()
+    app.var_empresa.set("800111222")
+    app._iniciar_consulta()
+    assert lanzados[-1][0] == {"800111222": "800111222"}
+
+
+def test_nit_manual_con_puntos_y_guion_se_consulta_canonico(app, monkeypatch):
+    lanzados = _capturar_hilos(monkeypatch)
+    app.entry_nit.insert(0, "900.123.456-7")
+    app._iniciar_consulta()
+    empresas, filtros = lanzados[-1][0], lanzados[-1][1]
+    assert empresas == {"9001234567": "9001234567"} and filtros.nit_proveedor == "9001234567"
+
+
+def test_dialogo_edicion_guarda_el_nit_canonico(raiz):
+    d = DialogoEdicion(raiz, "Nuevo", {})
+    d.ent_nombre.insert(0, "ACME")
+    d.ent_nit.insert(0, " 900.123.456-7 ")
+    d._aceptar()
+    assert d.resultado["nit"] == "9001234567"
+
+
+def test_editar_solo_el_nit_de_un_nombre_automatico_lo_vuelve_a_resolver(raiz, tmp_path, monkeypatch):
+    monkeypatch.setattr("ui_directorio.threading.Thread", HiloInmediato)
+    monkeypatch.setattr("ui_directorio.resolver_nombre_oficial",
+                        lambda client, nit: {"800111222": "NUEVA SAS"}.get(nit, ""))
+    dir_ = Directorio(str(tmp_path / "d.json"))
+    e = dir_.agregar("empresas", "VIEJA SAS", "900123456", nombre_auto=True)
+
+    class DialogoFalso:
+        def __init__(self, master, titulo, datos, resolver=None):
+            self.resultado = {"nombre": datos["nombre"], "nit": "800111222", "alias": "",
+                              "etiquetas": "", "notas": ""}
+
+        def wait_window(self):
+            pass
+    monkeypatch.setattr("ui_directorio.DialogoEdicion", DialogoFalso)
+    v = VentanaDirectorio(raiz, dir_, lambda: None, lambda: None)
+    panel = v.paneles["empresas"]
+    panel.tree.selection_set(e["id"])
+    panel.editar()
+    _procesar(raiz)
+    item = dir_.obtener("empresas", e["id"])
+    assert item["nombre"] == "NUEVA SAS" and item["nit"] == "800111222"
+    v.destroy()
+
+
+def test_nombres_descubiertos_en_consultas_quedan_como_automaticos(app):
+    app._actualizar_historiales([("ACME SAS", "111111111"), ("222222222", "222222222")], [])
+    assert app.directorio.buscar_por_nit("empresas", "111111111")["nombre_auto"] is True
+    assert app.directorio.buscar_por_nit("empresas", "222222222")["nombre_auto"] is False

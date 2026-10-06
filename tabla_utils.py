@@ -8,7 +8,10 @@ import re
 from datetime import date
 
 _PESOS_RE = re.compile(r"^\$\s*-?\d{1,3}(\.\d{3})*$")
-_FECHA_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# Fecha sola o marca ISO de Socrata ('2025-03-01T00:00:00.000'): se toma la fecha
+_FECHA_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})"
+                       r"(?:[T ]([01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?"
+                       r"(?:Z|[+-]\d{2}:?\d{2})?)?$")
 _NUM_RE = re.compile(r"^-?\d+(\.\d+)?$")
 
 
@@ -36,10 +39,11 @@ def parse_pesos(texto):
 
 def parse_fecha(texto):
     t = str(texto or "").strip()
-    if not _FECHA_RE.match(t):
+    m = _FECHA_RE.match(t)
+    if not m:
         return None
     try:
-        return date.fromisoformat(t)
+        return date.fromisoformat(m.group(1))
     except ValueError:
         return None
 

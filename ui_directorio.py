@@ -5,7 +5,7 @@ import threading
 from tkinter import StringVar, TclError, Text, Toplevel, messagebox, ttk
 
 from search import buscar_proveedores, resolver_nombre_oficial
-from storage import DuplicadoError
+from storage import DuplicadoError, nit_canonico
 
 
 def _existe(widget):
@@ -132,7 +132,7 @@ class DialogoEdicion(Toplevel):
 
     def _aceptar(self):
         nombre = self.ent_nombre.get().strip()
-        nit = self.ent_nit.get().strip()
+        nit = nit_canonico(self.ent_nit.get())     # '900.123.456-7' se guarda '9001234567'
         if not nombre and not nit:
             messagebox.showwarning("Datos vacios", "Ingrese al menos nombre o NIT.", parent=self)
             return
@@ -268,6 +268,9 @@ class PanelLista(ttk.Frame):
             error_guardado(e, self)
             return
         self._tras_cambio()
+        actual = self.dir.obtener(self.tipo, original["id"])
+        if self.tipo == "empresas" and actual is not None and not actual["nombre_resuelto"]:
+            self.ventana._resolver_pendientes()      # cambio el NIT: buscar el nombre nuevo
 
     def eliminar(self):
         sel = self._seleccion()
@@ -479,7 +482,8 @@ class DialogoBuscarEmpresa(Toplevel):
         nuevas = 0
         for r in sel:
             try:
-                self.directorio.agregar("empresas", r.get("nombre", ""), r.get("nit", ""))
+                self.directorio.agregar("empresas", r.get("nombre", ""), r.get("nit", ""),
+                                        nombre_auto=True)     # nombre del registro oficial
                 nuevas += 1
             except (DuplicadoError, ValueError):
                 continue

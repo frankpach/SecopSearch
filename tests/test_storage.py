@@ -335,3 +335,116 @@ def test_completar_nombre_solo_si_sigue_pendiente_y_con_el_mismo_nit(tmp_path):
     assert d.completar_nombre("empresas", b["id"], "800000001", "VIEJO") is False
     assert d.completar_nombre("empresas", "no-existe", "800000001", "X") is False
     assert d.completar_nombre("empresas", b["id"], "800000002", "  ") is False
+
+
+# ---- proteccion del archivo ante errores de lectura (revision final) -------------
+
+def _lectura_falla(monkeypatch, ruta):
+    """open() de `ruta` en modo lectura lanza PermissionError (archivo bloqueado)."""
+    import builtins
+    real_open = builtins.open
+
+    def open_falla(p, *a, **k):
+        modo = a[0] if a else k.get("mode", "r")
+        if os.path.abspath(str(p)) == os.path.abspath(str(ruta)) and "r" in modo:
+            raise PermissionError("bloqueado")
+        return real_open(p, *a, **k)
+    monkeypatch.setattr(builtins, "open", open_falla)
+
+
+def _respaldo_falla(monkeypatch):
+    real_replace = os.replace
+
+    def replace_falla(src, dst):
+        if ".corrupto" in str(dst):
+            raise PermissionError("bloqueado")
+        return real_replace(src, dst)
+    monkeypatch.setattr(os, "replace", replace_falla)
+
+
+def test_lectura_y_respaldo_fallidos_no_sobrescriben_el_directorio(tmp_path, monkeypatch):
+    ruta = tmp_path / "d.json"
+    d = Directorio(str(ruta))
+    d.agregar("empresas", "ACME", "900123456", notas="importante")
+    original = ruta.read_bytes()
+    with monkeypatch.context() as m:
+        _lectura_falla(m, ruta)
+        _respaldo_falla(m)
+        d2 = Directorio(str(ruta))
+    assert d2.aviso
+    assert d2.migrar_historiales([], []) == (0, 0)        # lo que hace la app al arrancar
+    with pytest.raises(OSError):
+        d2.agregar("empresas", "OTRA", "800000001")
+    assert ruta.read_bytes() == original
+    assert d2.listar("empresas") == []                     # la memoria no quedo a medias
+
+
+def test_error_de_lectura_no_se_trata_como_corrupcion(tmp_path, monkeypatch):
+    ruta = tmp_path / "d.json"
+    Directorio(str(ruta)).agregar("empresas", "ACME", "900123456")
+    original = ruta.read_bytes()
+    with monkeypatch.context() as m:
+        _lectura_falla(m, ruta)
+        d = Directorio(str(ruta))
+    assert "leer" in d.aviso and not any("corrupto" in n for n in os.listdir(tmp_path))
+    with pytest.raises(OSError):
+        d.guardar_preferencia("x", 1)
+    assert ruta.read_bytes() == original
+
+
+def test_json_danado_que_no_se_puede_respaldar_queda_protegido(tmp_path, monkeypatch):
+    ruta = tmp_path / "d.json"
+    ruta.write_text("{ danado", encoding="utf-8")
+    with monkeypatch.context() as m:
+        _respaldo_falla(m)
+        d = Directorio(str(ruta))
+    assert "danado" in d.aviso
+    with pytest.raises(OSError):
+        d.agregar("empresas", "A", "111111111")
+    assert ruta.read_text(encoding="utf-8") == "{ danado"
+
+
+def test_migracion_sin_nada_que_migrar_no_escribe(tmp_path):
+    d = nuevo(tmp_path)
+    assert d.migrar_historiales([str(tmp_path / "no_existe.json")], []) == (0, 0)
+    assert not os.path.exists(d.ruta)
+
+
+def test_respaldos_de_corrupcion_con_nombre_unico(tmp_path, monkeypatch):
+    import storage
+    from datetime import datetime as dt_real
+
+    class Fijo(dt_real):
+        @classmethod
+        def now(cls, tz=None):
+            return dt_real(2026, 10, 6, 12, 0, 0)
+    monkeypatch.setattr(storage, "datetime", Fijo)
+    ruta = tmp_path / "d.json"
+    for _ in range(2):
+        ruta.write_text("{ danado", encoding="utf-8")
+        Directorio(str(ruta))
+    assert len([n for n in os.listdir(tmp_path) if "corrupto" in n]) == 2
+
+
+def test_cambiar_solo_el_nit_de_un_nombre_resuelto_automaticamente_lo_reinicia(tmp_path):
+    d = nuevo(tmp_path)
+    e = d.agregar("empresas", "", "900123456")
+    assert d.completar_nombre("empresas", e["id"], "900123456", "ACME SAS")
+    d.actualizar("empresas", e["id"], nit="900.123.456")           # mismo NIT: no cambia
+    assert d.obtener("empresas", e["id"])["nombre"] == "ACME SAS"
+    d.actualizar("empresas", e["id"], nit="800111222")
+    r = d.obtener("empresas", e["id"])
+    assert r["nombre_resuelto"] is False and r["nombre"] == "800111222"
+
+
+def test_cambiar_el_nit_conserva_un_nombre_escrito_a_mano(tmp_path):
+    d = nuevo(tmp_path)
+    e = d.agregar("empresas", "Mi ACME", "900123456")
+    d.actualizar("empresas", e["id"], nit="800111222")
+    r = d.obtener("empresas", e["id"])
+    assert r["nombre"] == "Mi ACME" and r["nombre_resuelto"] is True
+    a = d.agregar("empresas", "", "700000001")
+    d.completar_nombre("empresas", a["id"], "700000001", "AUTO SAS")
+    d.actualizar("empresas", a["id"], nombre="Renombrada")          # ahora es manual
+    d.actualizar("empresas", a["id"], nit="700000002")
+    assert d.obtener("empresas", a["id"])["nombre"] == "Renombrada"

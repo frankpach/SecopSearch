@@ -207,3 +207,12 @@ def test_fetch_dataset_sin_where_ni_q_respeta_el_tamano_de_pagina():
     cli = ClienteFalso()
     SECOPQuery(cli)._fetch_dataset("jbjy-vk9h", [], "fecha_de_firma DESC", 500, 0)
     assert cli.llamadas[0][1]["$limit"] == 500 and "$where" not in cli.llamadas[0][1]
+
+
+def test_nit_del_proveedor_con_formato_se_consulta_canonico():
+    cli = ClienteFalso()
+    SECOPQuery(cli).consultar_pagina("ACME", "900.123.456-7", Filtros())
+    por_ds = dict(cli.llamadas)
+    assert "documento_proveedor='9001234567'" in por_ds["jbjy-vk9h"]["$where"]
+    assert por_ds["qmzu-gj57"]["$where"] == "nit='9001234567'"
+    assert por_ds["iaeu-rcn6"]["$where"] == "numero_identificacion='9001234567'"

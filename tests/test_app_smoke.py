@@ -518,3 +518,35 @@ def test_aviso_inicio_sin_busquedas_no_pregunta(app, monkeypatch):
     monkeypatch.setattr("app_secop.messagebox.showwarning",
                         lambda *a, **k: pytest.fail("no hay aviso"))
     AVISO_INICIO_REAL(app)
+
+
+# ---- revision final: avanzados ocultos visibles; fallo al pintar no bloquea la UI -------
+
+def test_filtros_avanzados_ocultos_pero_activos_se_indican(app, monkeypatch):
+    monkeypatch.setattr("app_secop.threading.Thread",
+                        lambda target=None, args=(), daemon=None, **k:
+                        type("H", (), {"start": lambda s: None})())
+    app.var_avanzado.set(True)
+    app._toggle_avanzado()
+    app.ent_av["estado"].insert(0, "activo")
+    assert app.chk_avanzado.cget("text") == "Filtros avanzados"     # a la vista: sin aviso
+    app.var_avanzado.set(False)
+    app._toggle_avanzado()
+    assert app.chk_avanzado.cget("text") == "Filtros avanzados activos (1)"
+    app.entry_texto.insert(0, "x")
+    app._iniciar_consulta()
+    assert "Filtros avanzados: Estado: activo" in app.lbl_rango.cget("text")
+    app._consultando = False
+    app._limpiar()
+    assert app.chk_avanzado.cget("text") == "Filtros avanzados"
+
+
+def test_error_al_pintar_los_resultados_termina_la_consulta_y_se_informa(app, monkeypatch):
+    def falla(*a, **k):
+        raise RuntimeError("fallo al pintar")
+    monkeypatch.setattr(app, "_renderizar_tabla_lazy", falla)
+    app._set_consultando(True)
+    app._mostrar_resultados_pagina([_fila("C1")], {}, [], False, 0, [], [])
+    assert app._consultando is False
+    assert str(app.btn_consultar.cget("state")) == "normal"
+    assert "fallo al pintar" in app.lbl_estado.cget("text")

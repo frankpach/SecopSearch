@@ -98,7 +98,8 @@ def test_comillas_se_escapan_en_texto_y_entidad():
 def test_inyeccion_en_nit_y_estado_queda_escapada():
     conds, _ = condiciones("jbjy-vk9h", Filtros(nit_proveedor="1' OR '1'='1", estado="x'--"))
     texto = " ".join(conds)
-    assert "documento_proveedor='1'' OR ''1''=''1'" in texto
+    # el NIT se canonicaliza (sin espacios) y las comillas siguen duplicadas
+    assert "documento_proveedor='1''OR''1''=''1'" in texto
     assert "LIKE '%X''--%'" in texto
 
 
@@ -194,3 +195,32 @@ def test_buscar_proveedores_y_resolver_nombre():
     assert resolver_nombre_oficial(cli, "900123456") == "ACME SAS"
     assert cli.llamadas[1][1]["$where"] == "nit='900123456'"
     assert resolver_nombre_oficial(ClienteFalso([]), "1") == ""
+
+
+# ---- revision final: el nombre visible no es criterio; NIT canonico; avanzados --------
+
+def test_con_nit_de_entidad_el_nombre_no_se_usa_como_criterio():
+    f = Filtros(entidad_nombre="Alcaldia Medellin (cliente VIP)", entidad_nit="890905211")
+    conds, q = condiciones("jbjy-vk9h", f)                  # busqueda general
+    assert q is None and conds == ["nit_entidad='890905211'"]
+    conds, q = condiciones("jbjy-vk9h", Filtros(nit_proveedor="900123456",
+                                               entidad_nombre="Alias", entidad_nit="890905211"))
+    assert not any("nombre_entidad" in c for c in conds)
+    conds, q = condiciones("jbjy-vk9h", Filtros(entidad_nombre="Alcaldia"))   # sin NIT: si
+    assert q == "Alcaldia"
+
+
+def test_nits_con_puntos_y_guion_se_envian_canonicos():
+    conds, _ = condiciones("jbjy-vk9h", Filtros(nit_proveedor="900.123.456-7",
+                                               entidad_nit=" 800.000.001 "))
+    assert "documento_proveedor='9001234567'" in conds
+    assert "nit_entidad='800000001'" in conds
+
+
+def test_descripcion_de_filtros_avanzados():
+    from search import descripcion_avanzados, n_avanzados
+    f = Filtros(texto="x", estado="activo", valor_min="1.000", modalidad="Directa")
+    assert n_avanzados(f) == 3
+    d = descripcion_avanzados(f)
+    assert "Estado: activo" in d and "Valor min: 1.000" in d and "Modalidad: Directa" in d
+    assert descripcion_avanzados(Filtros(texto="x")) == "" and n_avanzados(Filtros()) == 0

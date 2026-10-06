@@ -27,7 +27,11 @@ def test_parse_pesos():
 def test_parse_fecha():
     assert str(parse_fecha("2024-05-01")) == "2024-05-01"
     assert parse_fecha("2024-13-01") is None
-    assert parse_fecha("2024-05-01T00:00:00") is None
+    assert str(parse_fecha("2024-05-01T00:00:00")) == "2024-05-01"      # marca ISO: la fecha
+    assert str(parse_fecha("2025-03-01T00:00:00.000")) == "2025-03-01"
+    assert str(parse_fecha("2025-03-01 13:45:10")) == "2025-03-01"
+    assert parse_fecha("2025-03-01T99:00:00") is None
+    assert parse_fecha("2025-03-01Tbasura") is None
     assert parse_fecha(None) is None
 
 
@@ -105,3 +109,9 @@ def test_texto_pantalla():
     assert texto_pantalla("x" * 10, 5) == "xxxx…"
     assert texto_pantalla("abc", 5) == "abc"
     assert texto_pantalla(None) == ""
+
+
+def test_marcas_iso_se_ordenan_como_fechas():
+    filas = [{"f": "2025-03-01T00:00:00.000"}, {"f": "2024-12-31"}, {"f": "2025-01-15T10:00:00"}]
+    assert [f["f"][:10] for f in ordenar_filas(filas, "f")] == ["2024-12-31", "2025-01-15", "2025-03-01"]
+    assert clave_orden("2025-03-01T00:00:00.000")[0] == clave_orden("2025-03-01")[0]

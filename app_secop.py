@@ -29,9 +29,9 @@ from search import (
     Filtros, condiciones, orden_dataset, primer_valor_positivo, url_de,
     construir_where as _build_where, escapar_soql as _escape_sql, resolver_nombre_oficial,
     RANGOS, MODO_PERSONALIZADO, ETIQUETA_PERSONALIZADO, RANGO_POR_DEFECTO, rango_predefinido,
-    con_rango, descripcion_rango, identificar_fila, marcar_nuevas,
+    con_rango, descripcion_avanzados, descripcion_rango, identificar_fila, marcar_nuevas,
 )
-from storage import Directorio, DuplicadoError
+from storage import Directorio, DuplicadoError, nit_canonico
 from ui_directorio import DialogoBuscarEmpresa, VentanaDirectorio, error_guardado
 from paginacion import CachePaginas, TAMANOS_PAGINA, TAMANO_POR_DEFECTO, total_paginas, total_registros
 from copiador_tabla import CopiadorTabla
@@ -208,7 +208,8 @@ class SECOPQuery:
 
         f = (filtros or Filtros()).limpio()
         if nit:
-            f.nit_proveedor = str(nit).strip()
+            nit = nit_canonico(nit)            # '900.123.456-7' -> '9001234567' en toda la consulta
+            f.nit_proveedor = nit
 
         def _fetch(dataset_id):
             r = condiciones(dataset_id, f)
@@ -458,7 +459,7 @@ class SECOPQuery:
         """Total real por dataset (count(*)) con los mismos filtros. Los errores se propagan."""
         f = (filtros or Filtros()).limpio()
         if nit:
-            f.nit_proveedor = str(nit).strip()
+            f.nit_proveedor = nit_canonico(nit)
         total = {}
         for ds in ("jbjy-vk9h", "p6dx-8zbt", "rpmr-utcd"):
             r = condiciones(ds, f)
@@ -731,8 +732,9 @@ class AppSECOP(Tk):
         self.btn_buscar_empresa.grid(row=3, column=2, columnspan=2, sticky="w",
                                      padx=(0, 12), pady=(6, 0))
         self.var_avanzado = BooleanVar(value=False)
-        ttk.Checkbutton(frm, text="Filtros avanzados", variable=self.var_avanzado,
-                        command=self._toggle_avanzado).grid(row=3, column=4, sticky="w", pady=(6, 0))
+        self.chk_avanzado = ttk.Checkbutton(frm, text="Filtros avanzados", variable=self.var_avanzado,
+                                            command=self._toggle_avanzado)
+        self.chk_avanzado.grid(row=3, column=4, sticky="w", pady=(6, 0))
 
         # --- Fila 4: rango de fechas (SIEMPRE visible; por defecto el ultimo año) ---
         ttk.Label(frm, text="Fechas:").grid(row=4, column=0, sticky="w", padx=(0, 4), pady=(6, 0))
@@ -801,6 +803,16 @@ class AppSECOP(Tk):
             self.frm_avanzado.grid()
         else:
             self.frm_avanzado.grid_remove()
+        self._indicar_avanzados()
+
+    def _indicar_avanzados(self):
+        """Con el panel plegado, los filtros avanzados se siguen aplicando: se avisa."""
+        n = sum(1 for e in self.ent_av.values() if e.get().strip())
+        n += bool(self.var_modalidad.get().strip())
+        texto = "Filtros avanzados"
+        if n and not self.var_avanzado.get():
+            texto += f" activos ({n})"
+        self.chk_avanzado.config(text=texto)
 
     def _refrescar_combo_busquedas(self):
         self.combo_busqueda["values"] = [b["nombre"] for b in self.directorio.listar_busquedas()]
@@ -872,10 +884,14 @@ class AppSECOP(Tk):
         nit_prov = nit_manual or (self.empresas.get(empresa_sel) or "" if empresa_sel != "TODAS" else "")
         entidad_nombre = self.entry_entidad_nombre.get().strip()
         entidad_nit = self.entry_entidad_nit.get().strip()
-        entidad_sel = self.var_entidad.get()
-        if entidad_sel != "TODAS" and entidad_sel in self.entidades:
-            entidad_nombre = entidad_nombre or entidad_sel
-            entidad_nit = entidad_nit or self.entidades[entidad_sel]
+        ent = self._item_seleccionado("entidades") if self.var_entidad.get() != "TODAS" else None
+        if ent is not None:
+            # La clave del combo (nombre propio o "Nombre (NIT)") nunca es criterio:
+            # con NIT se filtra por el NIT exacto; sin NIT, por el nombre del registro
+            if ent.get("nit"):
+                entidad_nit = entidad_nit or ent["nit"]
+            else:
+                entidad_nombre = entidad_nombre or ent["nombre"]
         if self._clave_rango_actual() != MODO_PERSONALIZADO:
             self._on_rango()               # un rango predefinido siempre se recalcula a "hoy"
         base = Filtros(
@@ -1070,14 +1086,11 @@ class AppSECOP(Tk):
             self.lbl_estado.config(text=f"Entidad '{item['nombre']}' eliminada del directorio.")
 
     def _on_entidad_selected(self, event=None):
-        sel = self.var_entidad.get()
-        if sel != "TODAS" and sel in self.entidades:
-            nit = self.entidades[sel]
-            self.entry_entidad_nombre.delete(0, "end")
-            self.entry_entidad_nombre.insert(0, sel)
-            self.entry_entidad_nit.delete(0, "end")
-            if nit:
-                self.entry_entidad_nit.insert(0, nit)
+        ent = self._item_seleccionado("entidades") if self.var_entidad.get() != "TODAS" else None
+        if ent is not None:
+            # Con NIT basta el NIT (exacto); el nombre del combo puede ser un alias propio
+            self._poner(self.entry_entidad_nombre, "" if ent.get("nit") else ent["nombre"])
+            self._poner(self.entry_entidad_nit, ent.get("nit") or "")
 
     # -------------------------------------------------------------------------
     # PANEL METADATOS
@@ -1486,11 +1499,16 @@ class AppSECOP(Tk):
             messagebox.showwarning("Filtros invalidos", "\n".join(errores))
             return
 
-        # Armar lista de empresas a consultar
+        # Armar lista de empresas a consultar. El "nombre" se usa para buscar sanciones
+        # ($q): nunca la clave del combo (puede ser "Nombre (NIT)"), sino el nombre oficial
+        # del registro o, si esta pendiente de resolver, el NIT.
         if nit_manual:
+            nit_manual = nit_canonico(nit_manual)
             empresas = {nit_manual: nit_manual}
         elif empresa_sel != "TODAS":
-            empresas = {empresa_sel: filtros.nit_proveedor}
+            emp = self._item_seleccionado("empresas") or {}
+            nombre = emp.get("nombre") if emp.get("nombre_resuelto", True) else None
+            empresas = {nombre or filtros.nit_proveedor: filtros.nit_proveedor}
         else:
             empresas = {None: None}  # Busqueda general
 
@@ -1506,8 +1524,9 @@ class AppSECOP(Tk):
         self._omitidos = []
         self._pagina_actual = 1
         self._has_more = False
-        self.lbl_rango.config(text=descripcion_rango(filtros)
-                              + "  (sanciones y SIRI: sin filtro de fechas)")
+        self.lbl_rango.config(text="  |  ".join(filter(None, [
+            descripcion_rango(filtros) + "  (sanciones y SIRI: sin filtro de fechas)",
+            descripcion_avanzados(filtros)])))
         self._set_consultando(True)
 
         threading.Thread(
@@ -1642,8 +1661,22 @@ class AppSECOP(Tk):
         if token == self._consulta_id:
             self.lbl_estado.config(text=msg)
 
-    def _mostrar_resultados_pagina(self, filas, detalle, errores, has_more, offset,
-                                    nuevas_empresas, nuevas_entidades, omitidos=None):
+    def _mostrar_resultados_pagina(self, *args, **kwargs):
+        """Pinta una pagina. Si algo falla al pintarla, la consulta termina igual (la UI
+        no queda en "Consultando...") y el error se muestra en la barra de estado."""
+        try:
+            self._pintar_resultados_pagina(*args, **kwargs)
+        except Exception as e:
+            msg = str(e) or type(e).__name__
+            self._errores.append(f"Error al mostrar los resultados: {msg}")
+            try:
+                self._restaurar_estado_previo()
+            finally:
+                self._set_consultando(False)
+                self.lbl_estado.config(text=f"Error al mostrar los resultados: {msg}")
+
+    def _pintar_resultados_pagina(self, filas, detalle, errores, has_more, offset,
+                                  nuevas_empresas, nuevas_entidades, omitidos=None):
         self._errores.extend(errores)
         self._has_more = has_more
         self._pagina_detalle = detalle          # solo la pagina actual; no se acumula
@@ -1718,7 +1751,8 @@ class AppSECOP(Tk):
         try:
             for nombre, nit in nuevas_empresas:
                 try:
-                    self.directorio.agregar("empresas", nombre, nit, nombre_resuelto=(nombre != nit))
+                    self.directorio.agregar("empresas", nombre, nit, nombre_resuelto=(nombre != nit),
+                                            nombre_auto=True)   # nombre tomado de SECOP
                     n_emp += 1
                 except (DuplicadoError, ValueError):
                     pass
@@ -2402,6 +2436,7 @@ class AppSECOP(Tk):
         for e in self.ent_av.values():
             e.delete(0, "end")
         self.var_modalidad.set("")
+        self._indicar_avanzados()
         self._aplicar_rango_a_widgets(None)     # vuelve a "Ultimo año"
         self.lbl_estado.config(text="Resultados limpiados.")
 

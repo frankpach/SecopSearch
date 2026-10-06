@@ -5,6 +5,8 @@ import re
 from dataclasses import asdict, dataclass
 from datetime import date, timedelta
 
+from storage import nit_canonico
+
 _FECHA_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _DIGITOS_RE = re.compile(r"^[0-9]+$")
 CAMPOS_FECHA = ("fecha_desde", "fecha_hasta")
@@ -47,7 +49,12 @@ class Filtros:
     departamento: str = ""
 
     def limpio(self):
-        return Filtros(**{k: str(v or "").strip() for k, v in asdict(self).items()})
+        """Copia sin espacios sobrantes y con los NIT canonicos (sin puntos, guion ni
+        espacios): '900.123.456-7' se acepta en la UI pero a SoQL va '9001234567'."""
+        f = Filtros(**{k: str(v or "").strip() for k, v in asdict(self).items()})
+        f.nit_proveedor = nit_canonico(f.nit_proveedor)
+        f.entidad_nit = nit_canonico(f.entidad_nit)
+        return f
 
     def vacio(self):
         """True si no hay ningun criterio. Las fechas NO cuentan: un rango solo
@@ -134,7 +141,7 @@ def condiciones(dataset_id, filtros):
         conds.append(f"{m['nit_proveedor']}='{escapar_soql(f.nit_proveedor)}'")
     if f.entidad_nit:
         conds.append(f"{m['entidad_nit']}='{escapar_soql(f.entidad_nit)}'")
-    if f.entidad_nombre:
+    if f.entidad_nombre and not f.entidad_nit:   # con NIT, el nombre (alias, "Nombre (NIT)") sobra
         if general:
             partes_q.append(f.entidad_nombre)
         else:
@@ -158,6 +165,29 @@ def condiciones(dataset_id, filtros):
                 return None
             conds.append(_like_upper(m[clave], valor))
     return conds, (" ".join(partes_q) or None)
+
+
+CAMPOS_AVANZADOS = (("valor_min", "Valor min"), ("valor_max", "Valor max"),
+                    ("estado", "Estado"), ("departamento", "Departamento"),
+                    ("modalidad", "Modalidad"))
+
+
+def _avanzados(filtros):
+    f = filtros.limpio()
+    return [(etiqueta, getattr(f, campo)) for campo, etiqueta in CAMPOS_AVANZADOS
+            if getattr(f, campo)]
+
+
+def n_avanzados(filtros):
+    return len(_avanzados(filtros))
+
+
+def descripcion_avanzados(filtros):
+    """'Filtros avanzados: Estado: activo, ...' o '' si no hay ninguno activo."""
+    activos = _avanzados(filtros)
+    if not activos:
+        return ""
+    return "Filtros avanzados: " + ", ".join(f"{e}: {v}" for e, v in activos)
 
 
 def orden_dataset(dataset_id, filtros):

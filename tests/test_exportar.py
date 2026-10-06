@@ -48,6 +48,9 @@ def test_convertir_celda():
     assert convertir_celda("x", 7) == (7, None)
     assert convertir_celda("x", None) == (None, None)
     assert convertir_celda("x", {"url": "https://u"}) == ("https://u", None)
+    # Las hojas de detalle traen marcas ISO de Socrata: deben quedar como fecha real
+    assert convertir_celda("fecha_de_firma", "2025-03-01T00:00:00.000") == (
+        date(2025, 3, 1), "yyyy-mm-dd")
 
 
 def test_nombres_de_hoja_validos_y_unicos():

@@ -11,7 +11,8 @@ from datetime import datetime
 
 VERSION = 1
 TIPOS = ("empresas", "entidades")
-CAMPOS_EDITABLES = {"nombre", "nit", "alias", "notas", "etiquetas", "nombre_resuelto"}
+CAMPOS_EDITABLES = {"nombre", "nit", "alias", "notas", "etiquetas", "nombre_resuelto",
+                    "nombre_auto"}
 MAX_IDS = 2000
 
 
@@ -49,10 +50,16 @@ class DuplicadoError(ValueError):
         self.existente = existente
 
 
+class DirectorioProtegidoError(OSError):
+    """El archivo del directorio no se pudo leer (o respaldar si estaba danado): no se
+    escribe nada para no sobrescribir los datos del usuario con un directorio vacio."""
+
+
 class Directorio:
     def __init__(self, ruta=None):
         self.ruta = ruta or os.path.join(directorio_datos(), "directorio.json")
         self.aviso = ""
+        self.protegido = False          # True: el archivo en disco no se debe tocar
         self._lock = threading.RLock()
         self.datos = self._vacio()
         self._cargar()
@@ -62,6 +69,18 @@ class Directorio:
         return {"version": VERSION, "empresas": [], "entidades": [], "busquedas": []}
 
     # ---- persistencia --------------------------------------------------
+    def _proteger(self, motivo):
+        self.protegido = True
+        self.aviso = (f"{motivo} Para no perder datos, los cambios de esta sesion no se "
+                      f"guardaran. Cierre otros programas que usen {self.ruta} y reinicie la app.")
+
+    def _ruta_respaldo(self):
+        base = f"{self.ruta}.corrupto-{datetime.now():%Y%m%d%H%M%S-%f}"
+        destino, n = base, 1
+        while os.path.exists(destino):
+            destino, n = f"{base}-{n}", n + 1
+        return destino
+
     def _cargar(self):
         if not os.path.exists(self.ruta):
             return
@@ -75,16 +94,22 @@ class Directorio:
                     raise ValueError(clave)
             datos.setdefault("version", VERSION)
             self.datos = datos
-        except (OSError, ValueError):
-            destino = f"{self.ruta}.corrupto-{datetime.now():%Y%m%d%H%M%S}"
+        except ValueError:                   # contenido danado (JSON invalido o forma rara)
+            destino = self._ruta_respaldo()
             try:
                 os.replace(self.ruta, destino)
-            except OSError:
-                destino = "(no se pudo respaldar)"
+            except OSError as e:
+                self._proteger(f"El directorio esta danado y no se pudo respaldar ({e}).")
+                return
             self.aviso = (f"El directorio estaba danado; se respaldo en {destino} "
                           "y se creo uno nuevo.")
+        except OSError as e:                 # no se pudo LEER: no es corrupcion
+            self._proteger(f"No se pudo leer el directorio ({e}).")
 
     def guardar(self):
+        if self.protegido:
+            raise DirectorioProtegidoError(
+                "el directorio no se pudo leer al iniciar; no se guarda para no sobrescribirlo")
         os.makedirs(os.path.dirname(self.ruta) or ".", exist_ok=True)
         tmp = self.ruta + ".tmp"
         try:
@@ -157,7 +182,7 @@ class Directorio:
         return None
 
     def _agregar_item(self, tipo, nombre, nit="", alias="", notas="", etiquetas=None,
-                      nombre_resuelto=True):
+                      nombre_resuelto=True, nombre_auto=False):
         """Agrega en memoria (sin guardar). Debe llamarse dentro de `_tx`."""
         nombre = str(nombre or "").strip()
         nit = str(nit or "").strip()
@@ -171,15 +196,18 @@ class Directorio:
         item = {"id": uuid.uuid4().hex, "nombre": nombre, "nit": nit,
                 "alias": str(alias or "").strip(), "notas": str(notas or "").strip(),
                 "etiquetas": _etiquetas(etiquetas), "nombre_resuelto": resuelto,
+                "nombre_auto": resuelto and bool(nombre_auto),
                 "creado": _ahora(), "ultima_consulta": ""}
         self._lista(tipo).append(item)
         return item
 
     def agregar(self, tipo, nombre, nit="", alias="", notas="", etiquetas=None,
-                nombre_resuelto=True):
+                nombre_resuelto=True, nombre_auto=False):
+        """`nombre_auto`: el nombre vino de SECOP (no lo escribio el usuario); si luego
+        se cambia solo el NIT, ese nombre deja de valer y se vuelve a resolver."""
         with self._tx():
             item = self._agregar_item(tipo, nombre, nit, alias, notas, etiquetas,
-                                      nombre_resuelto)
+                                      nombre_resuelto, nombre_auto)
         return item
 
     def actualizar(self, tipo, id_, **campos):
@@ -203,6 +231,13 @@ class Directorio:
                 nuevo["etiquetas"] = _etiquetas(campos["etiquetas"])
             if "nombre" in campos and "nombre_resuelto" not in campos:
                 nuevo["nombre_resuelto"] = bool(str(campos["nombre"] or "").strip())
+            if "nombre" in campos and "nombre_auto" not in campos:
+                nuevo["nombre_auto"] = False             # escrito a mano
+            # Solo cambio el NIT: un nombre automatico (o pendiente) era el del NIT anterior
+            if ("nombre" not in campos and nuevo["nit"]
+                    and nit_canonico(nuevo["nit"]) != nit_canonico(item.get("nit"))
+                    and (item.get("nombre_auto") or not item.get("nombre_resuelto", True))):
+                nuevo.update(nombre=nuevo["nit"], nombre_resuelto=False, nombre_auto=False)
             dup = self.buscar_duplicado(tipo, nuevo["nit"], nuevo["nombre"], excluir_id=id_)
             if dup:
                 raise DuplicadoError(dup)
@@ -223,7 +258,7 @@ class Directorio:
             if (item is None or item.get("nombre_resuelto", True)
                     or nit_canonico(item.get("nit")) != canon):
                 return False
-            self.actualizar(tipo, id_, nombre=nombre, nombre_resuelto=True)
+            self.actualizar(tipo, id_, nombre=nombre, nombre_resuelto=True, nombre_auto=True)
         return True
 
     def eliminar(self, tipo, id_):
@@ -246,6 +281,7 @@ class Directorio:
                 d["notas"] = (d["notas"] + "\n" + o["notas"]).strip()
             if not d["nombre_resuelto"] and o["nombre_resuelto"]:
                 d["nombre"], d["nombre_resuelto"] = o["nombre"], True
+                d["nombre_auto"] = bool(o.get("nombre_auto"))
             if not d["alias"]:
                 d["alias"] = o["alias"]
             if not d["nit"]:
@@ -335,36 +371,39 @@ class Directorio:
     def migrar_historiales(self, rutas_empresas, rutas_entidades):
         """Importa los JSON antiguos una sola vez, todo o nada. Devuelve (n_empresas, n_entidades)."""
         with self._lock:
-            if self.datos.get("migrado") or self.datos["empresas"] or self.datos["entidades"]:
+            if (self.protegido or self.datos.get("migrado")
+                    or self.datos["empresas"] or self.datos["entidades"]):
                 return (0, 0)
             total = {"empresas": 0, "entidades": 0}
             leidos = []
+            for tipo, rutas in (("empresas", rutas_empresas), ("entidades", rutas_entidades)):
+                for ruta in rutas:
+                    if not os.path.exists(ruta):
+                        continue
+                    try:
+                        with open(ruta, "r", encoding="utf-8-sig") as f:
+                            lista = json.load(f)
+                    except (OSError, ValueError):
+                        continue
+                    if isinstance(lista, list):
+                        leidos.append((tipo, ruta, lista))
+            if not leidos:                       # nada que migrar: no se escribe nada
+                return (0, 0)
             with self._tx():
-                for tipo, rutas in (("empresas", rutas_empresas), ("entidades", rutas_entidades)):
-                    for ruta in rutas:
-                        if not os.path.exists(ruta):
+                for tipo, ruta, lista in leidos:
+                    for it in lista:
+                        if not isinstance(it, dict) or not it.get("nombre"):
                             continue
+                        nombre, nit = str(it["nombre"]), str(it.get("nit") or "")
                         try:
-                            with open(ruta, "r", encoding="utf-8-sig") as f:
-                                lista = json.load(f)
-                        except (OSError, ValueError):
+                            nuevo = self._agregar_item(tipo, nombre, nit,
+                                                       nombre_resuelto=(nombre != nit))
+                        except DuplicadoError:
                             continue
-                        if not isinstance(lista, list):
-                            continue
-                        leidos.append(ruta)
-                        for it in lista:
-                            if not isinstance(it, dict) or not it.get("nombre"):
-                                continue
-                            nombre, nit = str(it["nombre"]), str(it.get("nit") or "")
-                            try:
-                                nuevo = self._agregar_item(tipo, nombre, nit,
-                                                           nombre_resuelto=(nombre != nit))
-                            except DuplicadoError:
-                                continue
-                            nuevo["ultima_consulta"] = str(it.get("ultima_consulta") or "")
-                            total[tipo] += 1
+                        nuevo["ultima_consulta"] = str(it.get("ultima_consulta") or "")
+                        total[tipo] += 1
                 self.datos["migrado"] = True
-            for ruta in leidos:                      # respaldo solo tras guardar con exito
+            for _tipo, ruta, _lista in leidos:       # respaldo solo tras guardar con exito
                 try:
                     shutil.copy2(ruta, ruta + ".bak")
                 except OSError:
