@@ -8,12 +8,21 @@ Esta herramienta permite realizar debida diligencia automatizada sobre empresas 
 
 ## Funcionalidades
 
-- **Consulta integrada**: Busqueda por empresa predefinida, dataset especifico o NIT manual
-- **Metadatos en tiempo real**: Muestra fecha de ultima actualizacion de cada dataset
-- **Resultados por tabs**: Visualizacion organizada por dataset
-- **Tabla resumen**: Consolidado de registros, valores, estados y fechas
-- **Exportacion a Excel**: Archivo .xlsx con hoja por dataset + resumen
-- **Exportacion a CSV**: Archivos .csv individuales por dataset
+- **Consulta integrada**: proveedor (empresa/NIT), entidad compradora, UNSPSC o texto libre sobre el objeto del contrato o proceso.
+- **Rango de fechas**: por defecto el ultimo año (selector siempre visible, con rangos predefinidos o fechas propias); se aplica a todas las consultas y el pie de la tabla muestra el rango aplicado. Sanciones y SIRI no usan fechas.
+- **Filtros avanzados**: rango de valor, modalidad, estado y departamento (combinables).
+- **Buscar empresa por nombre**: encuentra el NIT en el registro de proveedores (varias palabras).
+- **Busquedas guardadas y novedades**: guarda una consulta con nombre, re-ejecutala y las filas nuevas desde la ultima ejecucion salen resaltadas. Al abrir la app ofrece ejecutarlas todas.
+- **Directorio editable**: empresas y entidades con nombre, NIT, alias, etiquetas y notas; editar, fusionar duplicados y busqueda por texto.
+- **Copia**: seleccion multiple, Ctrl+C (pega en Excel con columnas alineadas), copiar celda, fila, columna, como CSV o JSON; numeros sin formato por defecto.
+- **Paginacion**: paginas de 50/100/200/500 filas por dataset (100 por defecto), total real de registros, ultima pagina e ir a pagina N, cache de las ultimas 5 paginas y boton Cancelar.
+- **Exportacion**: dialogo con alcance (pagina actual, filas seleccionadas o todos los resultados), columnas y formato (Excel con formato, CSV unico, CSV por dataset, JSON). "Todos los resultados" escribe directo a disco pagina a pagina (no usa memoria), pide confirmacion si supera 1.000 registros y se puede cancelar sin dejar archivos parciales.
+
+## Datos y directorio
+
+El directorio se guarda en `%APPDATA%\SecopSearch\directorio.json` (empresas, entidades, busquedas guardadas y preferencias). La primera vez se importan `empresas_historial.json` y `entidades_historial.json` (si existen) y se dejan copias `.bak`; los originales no se borran. Si el archivo se danara, se respalda como `directorio.json.corrupto-<fecha>` y se crea uno nuevo.
+
+Al filtrar por UNSPSC, modalidad, estado o departamento, los datasets que no tienen esa columna (p. ej. SECOP Integrado no tiene UNSPSC) se omiten y la barra de estado lo indica.
 
 ## Datasets consultados
 
@@ -30,7 +39,7 @@ Esta herramienta permite realizar debida diligencia automatizada sobre empresas 
 ## Requisitos
 
 - Python 3.8+
-- Dependencias: `sodapy`, `pandas`, `openpyxl`, `tkinter`
+- Dependencias: `requests`, `openpyxl`, `tkinter`; `cryptography` solo para el certificado del servidor MCP (pruebas: `pytest`, ver `requirements-dev.txt`)
 
 ## Instalacion
 
@@ -54,7 +63,7 @@ python -m venv venv_secop
 .\venv_secop\Scripts\activate
 
 # Instalar dependencias
-pip install sodapy pandas openpyxl requests
+pip install requests openpyxl
 
 # Ejecutar
 python app_secop.py
@@ -87,22 +96,32 @@ Las siguientes empresas estan precargadas para consulta rapida:
 
 ## Como usar
 
-1. **Seleccionar empresa**: Use el dropdown "Empresa" o dejelo en "TODAS"
-2. **(Opcional) Ingresar NIT**: Si desea consultar otra empresa, escriba el NIT
-3. **Seleccionar dataset**: Use "TODOS" para consultar todos, o uno especifico
-4. **Presionar "Consultar"**: La app cargara los datos de la API
-5. **Revisar resultados**: Navegue por las pestanas para ver cada dataset
-6. **Exportar**: Use "Exportar Excel" o "Exportar CSV" para guardar
+1. **Definir criterios**: empresa (combo, NIT manual o "Buscar empresa por nombre..."), entidad, UNSPSC o texto del objeto
+2. **(Opcional) Ajustar fechas**: elija un rango predefinido o escriba fechas propias (por defecto, el ultimo año)
+3. **(Opcional) Filtros avanzados**: marque la casilla para filtrar por valor, estado, departamento o modalidad
+4. **Presionar "Consultar"**: La app cargara los datos de la API pagina a pagina
+5. **Revisar resultados**: navegue por las paginas y por las pestanas de cada dataset
+6. **Exportar**: use "Exportar..." y elija alcance, columnas y formato
+7. **(Opcional) Guardar la busqueda**: "Guardar actual..." para re-ejecutarla luego y ver las novedades
 
 ## Estructura de la interfaz
 
 ```
 +-------------------------------------------------------------+
-| SECOP II - Consulta Integrada                               |
+| SECOP II - Debida Diligencia                [Directorio...] |
 +-------------------------------------------------------------+
-| Parametros de Busqueda                                      |
-| Empresa: [TODAS ▼]  Dataset: [TODOS ▼]  NIT: [________]    |
-| [Consultar] [Exportar Excel] [Exportar CSV] [Limpiar]      |
+| Consulta                                                    |
+| Empresa: [TODAS ▼]           NIT manual: [________]         |
+| Entidad: [TODAS ▼]           Entidad NIT: [________]        |
+| UNSPSC: [______]  Entidad (nombre): [______]                |
+|   [Consultar] [Exportar...] [Limpiar] [Cancelar] Por pagina |
+| Texto del objeto: [_________] [Buscar empresa por nombre...] |
+|                                [x] Filtros avanzados        |
+| Fechas: [Ultimo año ▼]  Desde: [____]  Hasta: [____]        |
+| Filtros avanzados: Valor min/max, Estado, Departamento,     |
+|                    Modalidad (plegable)                     |
+| Busquedas guardadas: [______ ▼] [Ejecutar] [Ejecutar todas] |
+|                      [Guardar actual...] [Eliminar]         |
 +-------------------------------------------------------------+
 | Estado de Datasets                                          |
 | SECOP II Procesos: 2026-05-11... | Contratos: 2026-05-06...|
@@ -114,6 +133,7 @@ Las siguientes empresas estan precargadas para consulta rapida:
 | | Empresa | NIT | Dataset | Registros | Valor | Estado    | |
 | | ...                                                     | |
 | +---------------------------------------------------------+ |
+| [|<<] [<] Pagina 1 de N (total) [>] [>>|]  Ir a: [__] [Ir]  |
 +-------------------------------------------------------------+
 | Listo. Seleccione parametros y presione Consultar.          |
 +-------------------------------------------------------------+
@@ -133,7 +153,8 @@ Las siguientes empresas estan precargadas para consulta rapida:
 | "No se pudo conectar autenticado" | Verifique las credenciales en `.env` |
 | "Sin resultados" | Intente con otro NIT o verifique la conexion a internet |
 | La app se congela | Espere, las consultas a la API pueden tomar varios segundos |
-| Error al exportar Excel | Verifique que tenga permisos de escritura en la carpeta |
+| Error al exportar | Verifique que tenga permisos de escritura en la carpeta |
+| Error 500/503 de datos.gov.co | La app reintenta 2 veces; si persiste, espere unos minutos |
 
 ## Licencia
 
