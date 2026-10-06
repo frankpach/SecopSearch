@@ -31,6 +31,8 @@ from search import (
     Filtros, condiciones, orden_dataset, primer_valor_positivo, url_de,
     construir_where as _build_where, escapar_soql as _escape_sql,
 )
+from copiador_tabla import CopiadorTabla
+from tabla_utils import columnas_union, ordenar_filas, texto_pantalla, valor_visible
 
 # =============================================================================
 # CONFIGURACION
@@ -588,6 +590,7 @@ class AppSECOP(Tk):
 
         self._filas = []
         self._url_map = {}
+        self._filas_por_item = {}
         self._errores = []
         self._omitidos = []
         self._consultando = False
@@ -832,7 +835,7 @@ class AppSECOP(Tk):
         self._tabs_detalle = {}
 
     def _construir_tabla_resumen(self, parent):
-        self.tree = ttk.Treeview(parent, columns=COLS_IDS, show="headings", selectmode="browse")
+        self.tree = ttk.Treeview(parent, columns=COLS_IDS, show="headings", selectmode="extended")
 
         for col_id, col_titulo, col_ancho in COLUMNAS:
             self.tree.heading(col_id, text=col_titulo,
@@ -860,11 +863,17 @@ class AppSECOP(Tk):
         parent.columnconfigure(0, weight=1)
 
         self.tree.bind("<Double-1>", self._abrir_contrato)
-        self.tree.bind("<Button-3>", self._menu_contextual)
         self.tree.bind("<Motion>",   self._cursor_hover)
+        self.copiador = CopiadorTabla(
+            self, self.tree, COLS_IDS, [c[1] for c in COLUMNAS],
+            lambda: self._filas_por_item,
+            lambda msg: self.lbl_estado.config(text=msg),
+            extra_menu=self._menu_url,
+        )
+        self.copiador.instalar()
 
         ttk.Label(parent,
-                  text="Doble clic: abrir en SECOP  |  Clic derecho: opciones  |  Clic en columna: ordenar",
+                  text="Doble clic: abrir en SECOP  |  Ctrl+C: copiar seleccion  |  Clic derecho: copiar/opciones  |  Clic en columna: ordenar",
                   style="Meta.TLabel").grid(row=2, column=0, sticky="w", pady=(2, 0))
 
         # Controles de paginacion
@@ -1361,21 +1370,32 @@ class AppSECOP(Tk):
         if msgs:
             self.lbl_estado.config(text="Historial actualizado: " + ", ".join(msgs))
 
+    @staticmethod
+    def _formatear_detalle(col, valor):
+        if isinstance(valor, (dict, list)):
+            return valor_visible(valor)
+        v = "" if valor is None else str(valor)
+        low = col.lower()
+        if "valor" in low and v and v.replace(".", "").isdigit():
+            return formatear_pesos(v)
+        if "fecha" in low:
+            return formatear_fecha(v)
+        return v
+
     def _construir_tab_detalle(self, parent, nombre, data):
         """Crea un Treeview con todas las columnas del dataset crudo."""
         if not data:
             ttk.Label(parent, text="Sin datos.", style="Meta.TLabel").pack(padx=10, pady=10)
             return
 
-        # Columnas: privadas (_empresa, _nit) al final; las demas primero
-        todas = list(data[0].keys())
-        cols_pub  = [c for c in todas if not c.startswith("_")]
-        cols_priv = [c for c in todas if c.startswith("_")]
-        cols = cols_pub + cols_priv
+        # Columnas: privadas (_empresa, _nit) al final; las demas primero.
+        # Union de claves porque Socrata omite las columnas nulas.
+        todas = columnas_union(data)
+        cols = [c for c in todas if not c.startswith("_")] + [c for c in todas if c.startswith("_")]
+        titulos = [c.replace("_", " ").strip().title() for c in cols]
 
-        tree = ttk.Treeview(parent, columns=cols, show="headings", selectmode="browse")
-        for c in cols:
-            titulo = c.replace("_", " ").strip().title()
+        tree = ttk.Treeview(parent, columns=cols, show="headings", selectmode="extended")
+        for c, titulo in zip(cols, titulos):
             tree.heading(c, text=titulo)
             tree.column(c, width=130, anchor="w", minwidth=60)
 
@@ -1392,25 +1412,26 @@ class AppSECOP(Tk):
         tree.tag_configure("par",   background="#f7f9fc")
         tree.tag_configure("impar", background="white")
 
+        filas_por_item = {}
         for i, row in enumerate(data):
-            vals = []
-            for c in cols:
-                v = str(row.get(c, "") or "")
-                if "valor" in c.lower() and v and v.replace(".", "").isdigit():
-                    v = formatear_pesos(v)
-                elif "fecha" in c.lower():
-                    v = formatear_fecha(v)
-                vals.append(v[:120])
+            fila = {c: self._formatear_detalle(c, row.get(c)) for c in cols}
+            vals = [texto_pantalla(fila[c], 120) for c in cols]
             tag = "par" if i % 2 == 0 else "impar"
-            tree.insert("", "end", values=vals, tags=(tag,))
+            item = tree.insert("", "end", values=vals, tags=(tag,))
+            filas_por_item[item] = fila
 
-        ttk.Label(parent, text=f"{len(data)} registros  |  datos crudos del dataset",
+        CopiadorTabla(self, tree, cols, titulos, lambda: filas_por_item,
+                      lambda msg: self.lbl_estado.config(text=msg)).instalar()
+
+        ttk.Label(parent,
+                  text=f"{len(data)} registros  |  datos crudos del dataset  |  Ctrl+C copia la seleccion",
                   style="Meta.TLabel").grid(row=2, column=0, sticky="w", pady=(2, 0))
 
     def _renderizar_tabla_lazy(self, filas, offset):
         """Renderiza la pagina actual con controles de navegacion lazy."""
         self.tree.delete(*self.tree.get_children())
         self._url_map = {}
+        self._filas_por_item = {}
 
         total_en_pagina = len(filas)
         if total_en_pagina == 0:
@@ -1437,7 +1458,8 @@ class AppSECOP(Tk):
         self.btn_last.config(state="disabled")  # No sabemos cual es la ultima en lazy loading
 
         for i, fila in enumerate(filas, start=offset):
-            vals = [fila.get(c, "") for c in COLS_IDS]
+            vals = [texto_pantalla(fila.get(c, ""), 80) if c == "objeto" else fila.get(c, "")
+                    for c in COLS_IDS]
             tags = []
             if fila.get("sancion") == "SI":
                 tags.append("sancion")
@@ -1450,6 +1472,7 @@ class AppSECOP(Tk):
             if fila.get("url"):
                 tags.append("con_url")
             item = self.tree.insert("", "end", values=vals, tags=tuple(tags))
+            self._filas_por_item[item] = fila
             if fila.get("url"):
                 self._url_map[item] = fila["url"]
 
@@ -1478,14 +1501,9 @@ class AppSECOP(Tk):
         pass
 
     def _ordenar(self, col):
-        # En lazy loading no podemos ordenar localmente todos los datos;
-        # ordenamos solo la pagina visible
+        # En lazy loading solo se ordena la pagina visible, por tipo real
         inverso = self._orden_inverso.get(col, False)
-        filas_ordenadas = sorted(
-            self._filas,
-            key=lambda f: str(f.get(col, "") or "").lower(),
-            reverse=inverso,
-        )
+        filas_ordenadas = ordenar_filas(self._filas, col, inverso)
         self._orden_inverso[col] = not inverso
         self._renderizar_tabla_lazy(filas_ordenadas, (self._pagina_actual - 1) * self._filas_por_pagina)
 
@@ -1503,33 +1521,17 @@ class AppSECOP(Tk):
         else:
             self.lbl_estado.config(text="Este registro no tiene URL directa en SECOP II.")
 
-    def _menu_contextual(self, event):
-        import tkinter as tk
-        sel = self.tree.identify_row(event.y)
-        if not sel:
+    def _menu_url(self, menu, item):
+        url = self._url_map.get(item, "")
+        if not url:
             return
-        self.tree.selection_set(sel)
-        url = self._url_map.get(sel, "")
-
-        menu = tk.Menu(self, tearoff=0)
-        if url:
-            menu.add_command(label="Abrir en navegador",
-                             command=lambda: webbrowser.open(url, new=2))
-            menu.add_command(label="Copiar URL",
-                             command=lambda: (self.clipboard_clear(),
-                                             self.clipboard_append(url),
-                                             self.lbl_estado.config(text="URL copiada al portapapeles.")))
-            menu.add_separator()
-        menu.add_command(label="Copiar fila completa",
-                         command=lambda: self._copiar_fila(sel))
-        menu.tk_popup(event.x_root, event.y_root)
-
-    def _copiar_fila(self, item):
-        vals = self.tree.item(item, "values")
-        texto = "\t".join(str(v) for v in vals)
-        self.clipboard_clear()
-        self.clipboard_append(texto)
-        self.lbl_estado.config(text="Fila copiada al portapapeles.")
+        menu.add_command(label="Abrir en navegador",
+                         command=lambda: webbrowser.open(url, new=2))
+        menu.add_command(label="Copiar URL",
+                         command=lambda: (self.clipboard_clear(),
+                                          self.clipboard_append(url),
+                                          self.lbl_estado.config(text="URL copiada al portapapeles.")))
+        menu.add_separator()
 
     def _cursor_hover(self, event):
         item = self.tree.identify_row(event.y)
@@ -1695,6 +1697,7 @@ class AppSECOP(Tk):
         self.tree.delete(*self.tree.get_children())
         self._filas = []
         self._url_map = {}
+        self._filas_por_item = {}
         self._detalle_cache = {}
         self._pagina_actual = 1
         self._total_estimado = 0
