@@ -727,9 +727,10 @@ class AppSECOP(Tk):
         self.entry_texto = ttk.Entry(frm, width=45)
         self.entry_texto.grid(row=3, column=1, sticky="w", padx=(0, 4), pady=(6, 0))
         self.entry_texto.bind("<Return>", lambda e: self._iniciar_consulta())
-        ttk.Button(frm, text="Buscar empresa por nombre...",
-                   command=self._abrir_buscar_empresa).grid(row=3, column=2, columnspan=2,
-                                                            sticky="w", padx=(0, 12), pady=(6, 0))
+        self.btn_buscar_empresa = ttk.Button(frm, text="Buscar empresa por nombre...",
+                                             command=self._abrir_buscar_empresa)
+        self.btn_buscar_empresa.grid(row=3, column=2, columnspan=2, sticky="w",
+                                     padx=(0, 12), pady=(6, 0))
         self.var_avanzado = BooleanVar(value=False)
         ttk.Checkbutton(frm, text="Filtros avanzados", variable=self.var_avanzado,
                         command=self._toggle_avanzado).grid(row=3, column=4, sticky="w", pady=(6, 0))
@@ -744,14 +745,20 @@ class AppSECOP(Tk):
             values=[etiqueta for etiqueta, _ in RANGOS.values()] + [ETIQUETA_PERSONALIZADO])
         self.combo_rango.pack(side="left")
         self.combo_rango.bind("<<ComboboxSelected>>", lambda e: self._on_rango())
+        # Solo un cambio real del TEXTO pasa a "Personalizado" (no Tab, flechas, Ctrl+C...):
+        # se vigila la variable, y lo que escribe el propio programa no cuenta
+        self._fechas_escritas = ("", "")    # lo ultimo que escribieron _on_rango/_aplicar_rango
+        self._escribiendo_fechas = False
         ttk.Label(fr, text="   Desde:").pack(side="left")
-        self.ent_desde = ttk.Entry(fr, width=12)
+        self.var_desde = StringVar()
+        self.ent_desde = ttk.Entry(fr, width=12, textvariable=self.var_desde)
         self.ent_desde.pack(side="left", padx=(2, 8))
         ttk.Label(fr, text="Hasta:").pack(side="left")
-        self.ent_hasta = ttk.Entry(fr, width=12)
+        self.var_hasta = StringVar()
+        self.ent_hasta = ttk.Entry(fr, width=12, textvariable=self.var_hasta)
         self.ent_hasta.pack(side="left", padx=(2, 8))
-        for e in (self.ent_desde, self.ent_hasta):
-            e.bind("<KeyRelease>", lambda ev: self._on_fecha_editada())
+        for var in (self.var_desde, self.var_hasta):
+            var.trace_add("write", lambda *a: self._on_fecha_editada())
         ttk.Label(fr, text="AAAA-MM-DD; vacio = sin limite. Sanciones y SIRI no usan fechas.",
                   style="Meta.TLabel").pack(side="left")
         self._on_rango()
@@ -781,11 +788,13 @@ class AppSECOP(Tk):
         self.combo_busqueda.grid(row=6, column=1, sticky="w", padx=(0, 4), pady=(6, 0))
         acc = ttk.Frame(frm)
         acc.grid(row=6, column=2, columnspan=4, sticky="w", pady=(6, 0))
-        for texto, cmd in (("Ejecutar", self._ejecutar_busqueda_guardada),
-                           ("Ejecutar todas", self._ejecutar_todas),
-                           ("Guardar actual...", self._guardar_busqueda),
-                           ("Eliminar", self._eliminar_busqueda)):
-            ttk.Button(acc, text=texto, command=cmd).pack(side="left", padx=2)
+        self._btns_busqueda = {}            # se desactivan durante consultas y exportaciones
+        for clave, texto, cmd in (("ejecutar", "Ejecutar", self._ejecutar_busqueda_guardada),
+                                  ("todas", "Ejecutar todas", self._ejecutar_todas),
+                                  ("guardar", "Guardar actual...", self._guardar_busqueda),
+                                  ("eliminar", "Eliminar", self._eliminar_busqueda)):
+            self._btns_busqueda[clave] = ttk.Button(acc, text=texto, command=cmd)
+            self._btns_busqueda[clave].pack(side="left", padx=2)
         self._refrescar_combo_busquedas()
 
     def _toggle_avanzado(self):
@@ -821,12 +830,24 @@ class AppSECOP(Tk):
         """Elegir un rango predefinido rellena Desde/Hasta (se recalculan en cada consulta)."""
         clave = self._clave_rango_actual()
         if clave != MODO_PERSONALIZADO:
-            desde, hasta = rango_predefinido(clave)
+            self._poner_fechas(*rango_predefinido(clave))
+
+    def _poner_fechas(self, desde, hasta):
+        """Escribe Desde/Hasta desde el programa: no cuenta como edicion del usuario."""
+        self._escribiendo_fechas = True
+        try:
             self._poner(self.ent_desde, desde)
             self._poner(self.ent_hasta, hasta)
+        finally:
+            self._escribiendo_fechas = False
+        self._fechas_escritas = (self.ent_desde.get(), self.ent_hasta.get())
 
     def _on_fecha_editada(self):
-        self.var_rango.set(ETIQUETA_PERSONALIZADO)
+        """Pasa a "Personalizado" solo si el texto difiere de lo que escribio el programa."""
+        if self._escribiendo_fechas:
+            return
+        if (self.ent_desde.get(), self.ent_hasta.get()) != self._fechas_escritas:
+            self.var_rango.set(ETIQUETA_PERSONALIZADO)
 
     def _leer_rango(self):
         clave = self._clave_rango_actual()
@@ -840,8 +861,7 @@ class AppSECOP(Tk):
         modo = rango.get("modo", "ultimo_anio")
         if modo == MODO_PERSONALIZADO:
             self.var_rango.set(ETIQUETA_PERSONALIZADO)
-            self._poner(self.ent_desde, rango.get("desde", ""))
-            self._poner(self.ent_hasta, rango.get("hasta", ""))
+            self._poner_fechas(rango.get("desde", ""), rango.get("hasta", ""))
         else:
             self.var_rango.set(RANGOS.get(modo, RANGOS["ultimo_anio"])[0])
             self._on_rango()
@@ -1797,7 +1817,9 @@ class AppSECOP(Tk):
                 else:
                     tags.append("par" if i % 2 == 0 else "impar")
             if identificar_fila(fila) in self._nuevos:
-                tags = ["nuevo"]
+                # Una sancion nueva sigue en rojo: "sancion" se creo antes que "nuevo" y los
+                # tags creados primero tienen prioridad; el color de estado si cede al amarillo
+                tags = ["sancion", "nuevo"] if fila.get("sancion") == "SI" else ["nuevo"]
             if fila.get("url"):
                 tags.append("con_url")
             item = self.tree.insert("", "end", values=vals, tags=tuple(tags))
@@ -1992,14 +2014,21 @@ class AppSECOP(Tk):
         if filtros.vacio():
             messagebox.showwarning("Busqueda vacia", "Defina al menos un criterio antes de guardar.")
             return
-        errores = filtros.errores()
-        if errores:
-            messagebox.showwarning("Filtros invalidos", "\n".join(errores))
+        problemas = self._problemas_filtros(filtros)    # fechas, valores y NIT (manual o entidad)
+        if problemas:
+            messagebox.showwarning("Filtros invalidos", "\n".join(problemas))
             return
         nombre = simpledialog.askstring("Guardar busqueda", "Nombre de la busqueda:", parent=self)
         if not nombre or not nombre.strip():
             return
         nombre = nombre.strip()
+        existente = self.directorio.buscar_busqueda_por_nombre(nombre)
+        if existente and not messagebox.askyesno(
+                "Sobrescribir busqueda",
+                f"Ya existe la busqueda '{existente['nombre']}'. ¿Reemplazarla?\n\n"
+                "Su historial de novedades se reinicia: la proxima ejecucion no marcara "
+                "nada como nuevo.", parent=self):
+            return
         try:
             # Se guarda el MODO del rango (p. ej. "ultimo_anio"), no las fechas calculadas
             self.directorio.guardar_busqueda(nombre, filtros.a_dict(incluir_fechas=False),
@@ -2023,7 +2052,12 @@ class AppSECOP(Tk):
         b = self._busqueda_elegida()
         if b is None:
             return
-        self._cargar_filtros_en_widgets(Filtros.desde_dict(b["filtros"]), b.get("rango"))
+        try:
+            filtros = Filtros.desde_dict(b.get("filtros"))
+            self._cargar_filtros_en_widgets(filtros, b.get("rango"))
+        except (AttributeError, TypeError):          # datos guardados danados
+            messagebox.showwarning("Busqueda", f"La busqueda '{b['nombre']}' esta danada.")
+            return
         self.var_tamano.set(str(PAGINA_NOVEDADES))   # tamano fijo: comparacion de novedades consistente
         self._iniciar_consulta(busqueda_id=b["id"])
         if not self._consultando:                    # no arranco (filtros invalidos): tamano previo
@@ -2056,38 +2090,61 @@ class AppSECOP(Tk):
         threading.Thread(target=self._hilo_ejecutar_todas,
                          args=(busquedas, self._consulta_id), daemon=True).start()
 
+    def _ejecucion_cancelada(self, token):
+        return token != self._consulta_id or self._cancelar.is_set()
+
+    @staticmethod
+    def _problemas_filtros(filtros):
+        """Lo que impide consultar con `filtros` (fechas, valores y NIT); [] si nada."""
+        problemas = list(filtros.errores())
+        if filtros.nit_proveedor and not validar_nit(filtros.nit_proveedor):
+            problemas.append("NIT de proveedor invalido (8 a 11 digitos).")
+        if filtros.entidad_nit and not validar_nit(filtros.entidad_nit):
+            problemas.append("NIT de entidad invalido (8 a 11 digitos).")
+        return problemas
+
     def _hilo_ejecutar_todas(self, busquedas, token):
         """(Hilo de trabajo) Ejecuta la pagina 1 de cada busqueda y cuenta las novedades.
-        `token`: si _consulta_id cambia (Cancelar) se detiene y no toca la UI."""
-        query = SECOPQuery(SECOPClient(self.creds))
+        `token`: si _consulta_id cambia (Cancelar) se detiene y no registra ni toca la UI.
+        Pase lo que pase, el final se entrega a la UI (que se libera si el token sigue vigente)."""
         resumen = []
-        for b in busquedas:
-            if token != self._consulta_id or self._cancelar.is_set():
-                return
-            self.after(0, lambda n=b["nombre"]: self._progreso_consulta(f"Ejecutando '{n}'...", token))
-            # el rango se recalcula a "hoy" en cada ejecucion; las fechas guardadas se validan
-            filtros = con_rango(Filtros.desde_dict(b["filtros"]), b.get("rango"))
-            errores = filtros.errores() or (["sin criterios"] if filtros.vacio() else [])
-            if errores:
-                resumen.append(f"{b['nombre']}: filtros invalidos, no se ejecuto ({'; '.join(errores)})")
-                continue
-            # Igual que "Ejecutar" (que pone el NIT en el campo manual): mismas filas y mismos ids
-            nit = filtros.nit_proveedor or None
-            try:
-                filas, _, errs, _ = query.consultar_pagina(nit, nit, filtros, offset=0,
-                                                           page_size=PAGINA_NOVEDADES)
-                if errs:                             # pagina incompleta: no se registra
-                    resumen.append(f"{b['nombre']}: error ({errs[0]}); no se registro")
-                    continue
-                reales = [f for f in filas if f.get("fuente") != "—"]
-                primera = not b["ultima_ejecucion"]
-                nuevos = 0 if primera else len(marcar_nuevas(reales, b["ultimos_ids"]))
-                self.directorio.registrar_ejecucion(b["id"], [identificar_fila(f) for f in reales])
-                resumen.append(f"{b['nombre']}: " + ("primera ejecucion registrada"
-                                                      if primera else f"{nuevos} nuevo(s)"))
-            except Exception as e:                   # red, disco (OSError) o busqueda borrada
-                resumen.append(f"{b['nombre']}: error ({str(e) or type(e).__name__})")
-        self.after(0, lambda: self._fin_ejecutar_todas(resumen, token))
+        try:
+            query = SECOPQuery(SECOPClient(self.creds))
+            for b in busquedas:
+                if self._ejecucion_cancelada(token):
+                    return
+                nombre = str(b.get("nombre") or "?")
+                self.after(0, lambda n=nombre: self._progreso_consulta(f"Ejecutando '{n}'...", token))
+                try:
+                    # el rango se recalcula a "hoy" en cada ejecucion; lo guardado se valida
+                    filtros = con_rango(Filtros.desde_dict(b.get("filtros")), b.get("rango"))
+                    problemas = self._problemas_filtros(filtros) or (
+                        ["sin criterios"] if filtros.vacio() else [])
+                    if problemas:
+                        resumen.append(f"{nombre}: filtros invalidos, no se ejecuto "
+                                       f"({'; '.join(problemas)})")
+                        continue
+                    # Igual que "Ejecutar" (pone el NIT en el campo manual): mismas filas e ids
+                    nit = filtros.nit_proveedor or None
+                    filas, _, errs, _ = query.consultar_pagina(nit, nit, filtros, offset=0,
+                                                               page_size=PAGINA_NOVEDADES)
+                    if errs:                         # pagina incompleta: no se registra
+                        resumen.append(f"{nombre}: error ({errs[0]}); no se registro")
+                        continue
+                    reales = [f for f in filas if f.get("fuente") != "—"]
+                    primera = not b.get("ultima_ejecucion")
+                    nuevos = 0 if primera else len(marcar_nuevas(reales, b.get("ultimos_ids") or []))
+                    if self._ejecucion_cancelada(token):     # Cancelar llego durante la consulta
+                        return
+                    self.directorio.registrar_ejecucion(b["id"], [identificar_fila(f) for f in reales])
+                    resumen.append(f"{nombre}: " + ("primera ejecucion registrada"
+                                                    if primera else f"{nuevos} nuevo(s)"))
+                except Exception as e:               # datos corruptos, red, disco o busqueda borrada
+                    resumen.append(f"{nombre}: error ({str(e) or type(e).__name__})")
+        except Exception as e:                       # p. ej. no se pudo crear el cliente
+            resumen.append(f"Error: {str(e) or type(e).__name__}")
+        finally:
+            self.after(0, lambda: self._fin_ejecutar_todas(resumen, token))
 
     def _fin_ejecutar_todas(self, resumen, token):
         if token != self._consulta_id:               # cancelada: la UI ya se restauro
@@ -2182,6 +2239,8 @@ class AppSECOP(Tk):
         self.ent_desde.config(state=state)
         self.ent_hasta.config(state=state)
         self.combo_rango.config(state="disabled" if activo else "readonly")
+        for btn in list(self._btns_busqueda.values()) + [self.btn_buscar_empresa]:
+            btn.config(state=state)
         self.btn_cancelar.config(state="normal" if activo else "disabled")
         self.combo_tamano.config(state="disabled" if activo else "readonly")
         if activo:

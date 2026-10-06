@@ -1,6 +1,12 @@
 from datetime import date, timedelta
 
+import pytest
+
+import app_secop
 from search import Filtros, identificar_fila
+
+# La fixture `app` sustituye _aviso_inicio en la clase: se guarda el real al importar
+AVISO_INICIO_REAL = app_secop.AppSECOP._aviso_inicio
 
 
 def test_la_app_arranca_con_directorio_y_paneles(app):
@@ -152,31 +158,42 @@ def _fila(id_contrato):
 
 
 class QueryFalsa:
+    """Sustituye SECOPQuery en "Ejecutar todas": registra (nombre, nit, filtros)."""
     llamadas = []
+    errores = []          # errores de dataset que devuelve cada pagina
+    al_consultar = None   # gancho opcional (p. ej. pulsar Cancelar a mitad)
 
     def __init__(self, client):
         pass
 
     def consultar_pagina(self, nombre, nit=None, filtros=None, offset=0, page_size=100,
                          on_progress=None):
-        QueryFalsa.llamadas.append(filtros)
-        return [_fila("C1")], {}, [], False
+        QueryFalsa.llamadas.append((nombre, nit, filtros))
+        if QueryFalsa.al_consultar:
+            QueryFalsa.al_consultar()
+        return [_fila("C1")], {}, list(QueryFalsa.errores), False
 
 
-def test_ejecutar_todas_no_consulta_busquedas_con_fechas_guardadas_invalidas(app, monkeypatch):
+@pytest.fixture
+def query_falsa(monkeypatch):
     import app_secop
-    QueryFalsa.llamadas = []
+    QueryFalsa.llamadas, QueryFalsa.errores, QueryFalsa.al_consultar = [], [], None
     monkeypatch.setattr(app_secop, "SECOPQuery", QueryFalsa)
     infos = []
     monkeypatch.setattr("app_secop.messagebox.showinfo", lambda *a, **k: infos.append(a))
+    return infos
+
+
+def test_ejecutar_todas_no_consulta_busquedas_con_fechas_guardadas_invalidas(app, query_falsa):
+    infos = query_falsa
     app.directorio.guardar_busqueda("Mala", {"texto": "a"},
                                     {"modo": "personalizado", "desde": "2024-99-99", "hasta": ""})
     app.directorio.guardar_busqueda("Buena", {"texto": "b"}, {"modo": "30_dias"})
     app._set_consultando(True)
     app._hilo_ejecutar_todas(app.directorio.listar_busquedas(), app._consulta_id)
     app.update()
-    assert [f.texto for f in QueryFalsa.llamadas] == ["b"]   # la invalida no se consulta
-    assert QueryFalsa.llamadas[0].fecha_desde != ""           # rango recalculado a hoy
+    assert [c[2].texto for c in QueryFalsa.llamadas] == ["b"]   # la invalida no se consulta
+    assert QueryFalsa.llamadas[0][2].fecha_desde != ""           # rango recalculado a hoy
     resumen = infos[0][1]
     assert "Mala" in resumen and "invalid" in resumen.lower() and "Buena" in resumen
     assert app._consultando is False
@@ -242,3 +259,243 @@ def test_las_filas_nuevas_se_pintan_y_el_pie_muestra_el_rango(app, monkeypatch):
     assert "nuevo" not in tags[0] and "nuevo" in tags[1]
     texto = app.lbl_estado.cget("text")
     assert "1 NUEVO(S)" in texto and "Fechas: 2025-01-01 a 2025-12-31" in texto
+
+
+# ---- correcciones de la revision ----------------------------------------------------
+
+def test_las_fechas_no_dependen_de_eventos_de_teclado(app):
+    # Tab, flechas, Ctrl+C...: ninguna tecla por si sola cambia el modo; solo el texto
+    for entry in (app.ent_desde, app.ent_hasta):
+        assert not entry.bind("<KeyRelease>") and not entry.bind("<Key>")
+
+
+def test_sin_cambio_de_texto_no_pasa_a_personalizado(app):
+    app._on_fecha_editada()                              # p. ej. tras Tab o una flecha
+    assert app.var_rango.get() == "Último año"
+    assert app._leer_rango() == {"modo": "ultimo_anio"}
+
+
+def test_escribir_de_verdad_en_una_fecha_pasa_a_personalizado(app):
+    app.ent_hasta.insert("end", "x")                     # sin llamar a nada mas
+    assert app.var_rango.get() == "Personalizado"
+
+
+def test_reescribir_la_misma_fecha_no_cuenta_como_edicion_si_es_programatica(app):
+    app.var_rango.set("Últimos 30 días")
+    app._on_rango()
+    app._on_fecha_editada()
+    assert app._leer_rango() == {"modo": "30_dias"}
+    app._aplicar_rango_a_widgets({"modo": "6_meses"})
+    app._on_fecha_editada()
+    assert app._leer_rango() == {"modo": "6_meses"}
+    app._limpiar()
+    assert app._leer_rango() == {"modo": "ultimo_anio"}
+
+
+def test_guardar_tras_navegar_por_las_fechas_conserva_el_rango_movil(app, monkeypatch):
+    monkeypatch.setattr("app_secop.simpledialog.askstring", lambda *a, **k: "Movil")
+    app.entry_texto.insert(0, "x")
+    app.ent_desde.icursor(3)                             # moverse sin escribir
+    app._on_fecha_editada()
+    app._guardar_busqueda()
+    assert app.directorio.buscar_busqueda_por_nombre("Movil")["rango"] == {"modo": "ultimo_anio"}
+
+
+def test_guardar_con_nombre_existente_pide_confirmacion(app, monkeypatch):
+    preguntas = []
+    respuesta = [False]
+    monkeypatch.setattr("app_secop.simpledialog.askstring", lambda *a, **k: "rEPETIDA")
+    monkeypatch.setattr("app_secop.messagebox.askyesno",
+                        lambda *a, **k: preguntas.append(a) or respuesta[0])
+    b = app.directorio.guardar_busqueda("Repetida", {"texto": "viejo"})
+    app.directorio.registrar_ejecucion(b["id"], ["a"])
+    app.entry_texto.insert(0, "nuevo")
+    app._guardar_busqueda()                              # No: no se toca nada
+    assert preguntas and "nuev" in preguntas[0][1].lower()
+    assert app.directorio.buscar_busqueda_por_nombre("Repetida")["filtros"] == {"texto": "viejo"}
+    respuesta[0] = True
+    app._guardar_busqueda()                              # Si: se sobrescribe
+    assert app.directorio.buscar_busqueda_por_nombre("Repetida")["filtros"] == {"texto": "nuevo"}
+
+
+def test_guardar_nombre_nuevo_no_pide_confirmacion(app, monkeypatch):
+    monkeypatch.setattr("app_secop.simpledialog.askstring", lambda *a, **k: "Nueva")
+    monkeypatch.setattr("app_secop.messagebox.askyesno",
+                        lambda *a, **k: pytest.fail("no debia preguntar"))
+    app.entry_texto.insert(0, "x")
+    app._guardar_busqueda()
+    assert app.directorio.buscar_busqueda_por_nombre("Nueva") is not None
+
+
+@pytest.mark.parametrize("activa", ["consultando", "exportando"])
+def test_botones_de_busquedas_y_empresa_se_desactivan_durante_operaciones(app, activa):
+    botones = list(app._btns_busqueda.values()) + [app.btn_buscar_empresa]
+    getattr(app, f"_set_{activa}")(True)
+    assert all(str(b.cget("state")) == "disabled" for b in botones)
+    getattr(app, f"_set_{activa}")(False)
+    assert all(str(b.cget("state")) == "normal" for b in botones)
+
+
+def test_ejecutar_todas_desactiva_los_botones(app, monkeypatch):
+    monkeypatch.setattr("app_secop.threading.Thread",
+                        lambda target=None, args=(), daemon=None, **k:
+                        type("H", (), {"start": lambda s: None})())
+    app.directorio.guardar_busqueda("B", {"texto": "x"})
+    app._ejecutar_todas()
+    assert str(app._btns_busqueda["guardar"].cget("state")) == "disabled"
+    assert str(app.btn_buscar_empresa.cget("state")) == "disabled"
+
+
+def test_una_sancion_nueva_conserva_el_resaltado_rojo(app):
+    sancion = dict(_fila("S1"), sancion="SI", fuente="Sancion SECOP II")
+    normal = _fila("C1")
+    app._nuevos = {identificar_fila(sancion), identificar_fila(normal)}
+    app._renderizar_tabla_lazy([sancion, normal], 0)
+    t_sancion, t_normal = [app.tree.item(i, "tags") for i in app.tree.get_children()]
+    assert list(t_sancion[:2]) == ["sancion", "nuevo"]
+    assert "nuevo" in t_normal
+    # prioridad de tags: el creado primero gana (sancion antes que nuevo)
+    nombres = list(app.tree.tk.splitlist(app.tree.tk.call(app.tree._w, "tag", "names")))
+    assert nombres.index("sancion") < nombres.index("nuevo")
+
+
+def test_ejecutar_todas_cancelada_antes_de_registrar_no_registra(app, query_falsa):
+    b = app.directorio.guardar_busqueda("B", {"texto": "x"})
+    app._set_consultando(True)
+    token = app._consulta_id
+    QueryFalsa.al_consultar = app._cancelar_operacion    # Cancelar mientras consulta
+    app._hilo_ejecutar_todas([dict(b)], token)
+    app.update()
+    assert app.directorio.obtener_busqueda(b["id"])["ultima_ejecucion"] == ""
+    assert query_falsa == [] and app._consultando is False
+
+
+@pytest.mark.parametrize("dato", [{"filtros": ["no", "dict"]}, {"rango": "6_meses"},
+                                  {"filtros": None, "rango": 7}])
+def test_ejecutar_todas_con_datos_corruptos_informa_y_libera_la_ui(app, query_falsa, dato):
+    infos = query_falsa
+    mala = dict({"id": "m", "nombre": "Corrupta", "filtros": {"texto": "a"},
+                 "rango": {"modo": "ultimo_anio"}, "ultimos_ids": [], "ultima_ejecucion": ""},
+                **dato)
+    buena = app.directorio.guardar_busqueda("Buena", {"texto": "b"})
+    app._set_consultando(True)
+    app._hilo_ejecutar_todas([mala, dict(buena)], app._consulta_id)
+    app.update()
+    assert app._consultando is False and infos
+    assert "Corrupta" in infos[0][1] and "Buena" in infos[0][1]
+
+
+def test_ejecutar_todas_si_falla_crear_la_consulta_libera_la_ui(app, query_falsa, monkeypatch):
+    def falla(*a, **k):
+        raise RuntimeError("sin cliente")
+    monkeypatch.setattr(app_secop, "SECOPClient", falla)
+    b = app.directorio.guardar_busqueda("B", {"texto": "x"})
+    app._set_consultando(True)
+    app._hilo_ejecutar_todas([dict(b)], app._consulta_id)
+    app.update()
+    assert app._consultando is False and "sin cliente" in query_falsa[0][1]
+
+
+def test_guardar_busqueda_con_nit_manual_invalido_avisa(app, monkeypatch):
+    avisos = []
+    monkeypatch.setattr("app_secop.messagebox.showwarning", lambda *a, **k: avisos.append(a))
+    monkeypatch.setattr("app_secop.simpledialog.askstring", lambda *a, **k: "N")
+    app.entry_nit.insert(0, "12")
+    app._guardar_busqueda()
+    assert avisos and app.directorio.buscar_busqueda_por_nombre("N") is None
+
+
+def test_guardar_busqueda_con_nit_de_entidad_invalido_avisa(app, monkeypatch):
+    avisos = []
+    monkeypatch.setattr("app_secop.messagebox.showwarning", lambda *a, **k: avisos.append(a))
+    monkeypatch.setattr("app_secop.simpledialog.askstring", lambda *a, **k: "N")
+    app.entry_texto.insert(0, "x")
+    app.entry_entidad_nit.insert(0, "abc")
+    app._guardar_busqueda()
+    assert avisos and app.directorio.buscar_busqueda_por_nombre("N") is None
+
+
+def test_ejecutar_todas_omite_busquedas_con_nit_invalido(app, query_falsa):
+    app.directorio.guardar_busqueda("MalNit", {"nit_proveedor": "12"})
+    app.directorio.guardar_busqueda("MalEnt", {"texto": "a", "entidad_nit": "xyz"})
+    app._set_consultando(True)
+    app._hilo_ejecutar_todas(app.directorio.listar_busquedas(), app._consulta_id)
+    app.update()
+    assert QueryFalsa.llamadas == []
+    resumen = query_falsa[0][1]
+    assert "MalNit" in resumen and "MalEnt" in resumen and "invalid" in resumen.lower()
+
+
+def test_ejecutar_todas_pasa_el_nit_como_nombre_y_nit(app, query_falsa):
+    app.directorio.guardar_busqueda("ConNit", {"nit_proveedor": "900123456"})
+    app.directorio.guardar_busqueda("SinNit", {"texto": "a"})
+    app._set_consultando(True)
+    app._hilo_ejecutar_todas(app.directorio.listar_busquedas(), app._consulta_id)
+    app.update()
+    assert [(c[0], c[1]) for c in QueryFalsa.llamadas] == [("900123456", "900123456"),
+                                                           (None, None)]
+
+
+def test_ejecutar_todas_no_registra_si_la_pagina_tiene_errores(app, query_falsa):
+    b = app.directorio.guardar_busqueda("B", {"texto": "x"})
+    QueryFalsa.errores = ["Contratos: 503"]
+    app._set_consultando(True)
+    app._hilo_ejecutar_todas([dict(b)], app._consulta_id)
+    app.update()
+    assert app.directorio.obtener_busqueda(b["id"])["ultima_ejecucion"] == ""
+    assert "503" in query_falsa[0][1]
+
+
+def test_ejecutar_no_compara_ni_registra_si_la_pagina_1_tiene_errores(app, monkeypatch):
+    monkeypatch.setattr(app_secop.AppSECOP, "_iniciar_conteo", lambda self: None)
+    monkeypatch.setattr(app_secop.AppSECOP, "_mostrar_errores", lambda self: None)
+    b = app.directorio.guardar_busqueda("X", {"texto": "a"})
+    app.directorio.registrar_ejecucion(b["id"], ["previo"])
+    antes = app.directorio.obtener_busqueda(b["id"])["ultima_ejecucion"]
+    app._filtros_activos = {"empresas": {None: None}, "filtros": Filtros(texto="a")}
+    app._busqueda_activa = b["id"]
+    app._mostrar_resultados_pagina([_fila("C1")], {}, ["Procesos: 503"], False, 0, [], [])
+    guardada = app.directorio.obtener_busqueda(b["id"])
+    assert guardada["ultimos_ids"] == ["previo"] and guardada["ultima_ejecucion"] == antes
+    assert app._nuevos == set() and app._busqueda_activa is None
+    assert "sin registrar" in app.lbl_estado.cget("text")
+
+
+def test_consulta_solo_por_nit_usa_el_ultimo_anio(app, monkeypatch):
+    lanzados = []
+    monkeypatch.setattr("app_secop.threading.Thread",
+                        lambda target=None, args=(), daemon=None, **k:
+                        type("H", (), {"start": lambda s: lanzados.append(args)})())
+    app.entry_nit.insert(0, "900123456")
+    app._iniciar_consulta()
+    empresas, filtros = lanzados[0][0], lanzados[0][1]
+    hoy = date.today()
+    assert empresas == {"900123456": "900123456"}
+    assert filtros.nit_proveedor == "900123456"
+    assert (filtros.fecha_desde, filtros.fecha_hasta) == (
+        (hoy - timedelta(days=365)).isoformat(), hoy.isoformat())
+
+
+def test_aviso_inicio_muestra_el_aviso_una_vez_y_ofrece_ejecutar(app, monkeypatch):
+    avisos, preguntas, ejecutadas = [], [], []
+    monkeypatch.setattr("app_secop.messagebox.showwarning", lambda *a, **k: avisos.append(a))
+    monkeypatch.setattr("app_secop.messagebox.askyesno",
+                        lambda *a, **k: preguntas.append(a) or True)
+    monkeypatch.setattr(app_secop.AppSECOP, "_ejecutar_todas",
+                        lambda self: ejecutadas.append(1))
+    app.directorio.aviso = "El directorio estaba danado; se respaldo en X"
+    app.directorio.guardar_busqueda("B", {"texto": "x"})
+    AVISO_INICIO_REAL(app)
+    assert len(avisos) == 1 and "danado" in avisos[0][1]
+    assert app.directorio.aviso == ""
+    assert preguntas and "1 busqueda" in preguntas[0][1] and ejecutadas == [1]
+    AVISO_INICIO_REAL(app)                                  # el aviso no se repite
+    assert len(avisos) == 1
+
+
+def test_aviso_inicio_sin_busquedas_no_pregunta(app, monkeypatch):
+    monkeypatch.setattr("app_secop.messagebox.askyesno",
+                        lambda *a, **k: pytest.fail("no debia preguntar"))
+    monkeypatch.setattr("app_secop.messagebox.showwarning",
+                        lambda *a, **k: pytest.fail("no hay aviso"))
+    AVISO_INICIO_REAL(app)
