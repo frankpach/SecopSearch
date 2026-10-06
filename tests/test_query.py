@@ -201,3 +201,9 @@ def test_reintenta_ante_timeout(monkeypatch):
     cli.session.get = get
     monkeypatch.setattr(app_secop.time, "sleep", lambda s: None)
     assert cli.get("x") == [] and len(llamadas) == 2
+
+
+def test_fetch_dataset_sin_where_ni_q_respeta_el_tamano_de_pagina():
+    cli = ClienteFalso()
+    SECOPQuery(cli)._fetch_dataset("jbjy-vk9h", [], "fecha_de_firma DESC", 500, 0)
+    assert cli.llamadas[0][1]["$limit"] == 500 and "$where" not in cli.llamadas[0][1]

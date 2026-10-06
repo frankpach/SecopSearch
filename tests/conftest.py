@@ -1,4 +1,5 @@
 import os
+import tkinter
 
 import pytest
 
@@ -17,3 +18,28 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "live" in item.keywords:
             item.add_marker(saltar)
+
+
+@pytest.fixture
+def app(monkeypatch, tmp_path):
+    """AppSECOP real, oculta y aislada (cwd, datos y sin red al arrancar)."""
+    # cwd aislado: la app busca el .env y los JSON antiguos en el directorio de trabajo
+    monkeypatch.chdir(tmp_path)
+    import app_secop
+    monkeypatch.setattr(app_secop.AppSECOP, "_cargar_metadatos_async", lambda self: None)
+    monkeypatch.setattr(app_secop.AppSECOP, "_aviso_inicio", lambda self: None, raising=False)
+    # En Windows, crear un Tk falla de vez en cuando con TclError (init.tcl "no encontrado")
+    # aunque haya display: se reintenta y solo se salta si falla siempre.
+    error = None
+    for _ in range(5):
+        try:
+            a = app_secop.AppSECOP()
+            break
+        except tkinter.TclError as e:
+            error = e
+    else:
+        pytest.skip("sin display: %s" % error)
+    a.withdraw()
+    a.update()
+    yield a
+    a.destroy()

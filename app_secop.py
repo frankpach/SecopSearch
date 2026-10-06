@@ -31,6 +31,7 @@ from search import (
     Filtros, condiciones, orden_dataset, primer_valor_positivo, url_de,
     construir_where as _build_where, escapar_soql as _escape_sql,
 )
+from paginacion import CachePaginas, TAMANOS_PAGINA, TAMANO_POR_DEFECTO, total_paginas, total_registros
 from copiador_tabla import CopiadorTabla
 from tabla_utils import columnas_union, ordenar_filas, texto_pantalla, valor_visible
 
@@ -221,7 +222,8 @@ class SECOPQuery:
     # -------------------------------------------------------------------------
     def _fetch_dataset(self, dataset_id, conds, order_col, limit, offset, q_text=None, extra_params=None):
         """Ejecuta GET paginado a un dataset. Retorna lista de registros.
-        Si q_text se proporciona, usa $q (full-text search, mucho mas rapido que LIKE)."""
+        Si q_text se proporciona, usa $q (full-text search, mucho mas rapido que LIKE).
+        El tamano de pagina (`limit`) lo decide quien llama; aqui no se recorta."""
         params = {"$limit": limit, "$offset": offset, "$order": order_col}
         if extra_params:
             params.update(extra_params)
@@ -230,8 +232,6 @@ class SECOPQuery:
         where = _build_where(conds)
         if where:
             params["$where"] = where
-        elif not q_text:
-            params["$limit"] = min(limit, 200)
         return self.client.get(dataset_id, params)
 
     # -------------------------------------------------------------------------
@@ -594,13 +594,18 @@ class AppSECOP(Tk):
         self._errores = []
         self._omitidos = []
         self._consultando = False
-        self._detalle_cache = {}
 
-        # Paginacion lazy loading
-        self._filas_por_pagina = 500
+        # Paginacion lazy loading: solo la pagina actual vive en memoria
+        self._filas_por_pagina = TAMANO_POR_DEFECTO
         self._pagina_actual = 1
-        self._total_estimado = 0       # registros acumulados hasta ahora
+        self._pagina_previa = None     # para restaurar si se cancela una carga
         self._has_more = False         # si hay mas paginas disponibles
+        self._conteos = None           # {dataset: total} real; llega en segundo plano
+        self._total_paginas = None
+        self._cache = CachePaginas()   # ultimas paginas visitadas (ir y volver sin consultar)
+        self._pagina_detalle = {}      # detalle crudo SOLO de la pagina actual
+        self._consulta_id = 0          # descarta resultados de consultas canceladas o viejas
+        self._cancelar = threading.Event()
         self._filtros_activos = None   # dict con filtros para reconsultar paginas
         self._orden_inverso = {}       # estado de ordenamiento por columna
 
@@ -712,6 +717,15 @@ class AppSECOP(Tk):
         self.btn_csv.pack(side="left", padx=2)
         self.btn_limpiar = ttk.Button(btn_frm, text="Limpiar", command=self._limpiar)
         self.btn_limpiar.pack(side="left", padx=2)
+        self.btn_cancelar = ttk.Button(btn_frm, text="Cancelar", command=self._cancelar_operacion,
+                                       state="disabled")
+        self.btn_cancelar.pack(side="left", padx=2)
+        ttk.Label(btn_frm, text="Por pagina:").pack(side="left", padx=(10, 2))
+        self.var_tamano = StringVar(value=str(TAMANO_POR_DEFECTO))
+        self.combo_tamano = ttk.Combobox(btn_frm, textvariable=self.var_tamano, state="readonly",
+                                         width=5, values=[str(t) for t in TAMANOS_PAGINA])
+        self.combo_tamano.pack(side="left")
+        self.combo_tamano.bind("<<ComboboxSelected>>", lambda e: self._on_tamano())
 
         # Barra de progreso
         self.progress = ttk.Progressbar(frm, mode="indeterminate", length=180)
@@ -891,6 +905,11 @@ class AppSECOP(Tk):
         self.lbl_pag.pack(side="left", padx=6)
         self.btn_next.pack(side="left", padx=2)
         self.btn_last.pack(side="left", padx=2)
+        ttk.Label(self._pag_frm, text="Ir a:", style="Meta.TLabel").pack(side="left", padx=(12, 2))
+        self.ent_ir = ttk.Entry(self._pag_frm, width=5)
+        self.ent_ir.pack(side="left")
+        self.ent_ir.bind("<Return>", lambda e: self._ir_a_pagina())
+        ttk.Button(self._pag_frm, text="Ir", width=3, command=self._ir_a_pagina).pack(side="left", padx=2)
         self._pag_frm.grid_remove()  # Oculto hasta que haya datos
 
     # -------------------------------------------------------------------------
@@ -1013,7 +1032,8 @@ class AppSECOP(Tk):
         try:
             self._generar_cert_localhost(crt_path, key_path)
         except Exception as e:
-            self.after(0, lambda: messagebox.showerror("Certificado SSL", f"No se pudo generar:\n{e}"))
+            # `e` deja de existir al salir del except: el mensaje se fija como argumento por defecto
+            self.after(0, lambda msg=str(e): messagebox.showerror("Certificado SSL", f"No se pudo generar:\n{msg}"))
             self.after(0, self._mcp_reset_ui)
             return
 
@@ -1214,24 +1234,29 @@ class AppSECOP(Tk):
             messagebox.showwarning("Filtros invalidos", "\n".join(errs_filtros))
             return
 
-        self._limpiar_tabla()                       # deja _filtros_activos en None
-        # Guardar filtros activos para navegacion lazy. Se asigna DESPUES de limpiar: antes
-        # se asignaban y _limpiar_tabla() los borraba enseguida (defecto que se fija en la Tarea 7).
+        self._limpiar_tabla()
+        # _limpiar_tabla() deja _filtros_activos en None: se asigna DESPUES
         self._filtros_activos = {"empresas": empresas, "filtros": filtros}
+        self._filas_por_pagina = int(self.var_tamano.get())
+        self._consulta_id += 1
+        self._cancelar.clear()
+        self._pagina_previa = None
         self._errores = []
+        self._omitidos = []
         self._pagina_actual = 1
-        self._total_estimado = 0
         self._has_more = False
         self._set_consultando(True)
 
         threading.Thread(
             target=self._hilo_consulta,
-            args=(empresas, filtros, 0),
+            args=(empresas, filtros, 0, self._consulta_id),
             daemon=True,
         ).start()
 
-    def _hilo_consulta(self, empresas, filtros, offset):
-        """Consulta UNA pagina (lazy loading) usando un cliente local para evitar problemas de hilos."""
+    def _hilo_consulta(self, empresas, filtros, offset, token):
+        """Consulta UNA pagina (lazy loading) usando un cliente local para evitar problemas de hilos.
+        `token` es el _consulta_id con que se lanzo: si cambio (cancelada o reemplazada), el
+        resultado se descarta sin tocar la UI."""
         # Cliente local para este hilo (requests.Session no es thread-safe)
         client_local = SECOPClient(self.creds)
         query_local = SECOPQuery(client_local)
@@ -1250,8 +1275,10 @@ class AppSECOP(Tk):
                 filtros=filtros,
                 offset=offset,
                 page_size=self._filas_por_pagina,
-                on_progress=lambda msg: self.after(0, lambda m=msg: self.lbl_estado.config(text=m))
+                on_progress=lambda msg: self.after(0, lambda m=msg: self._progreso_consulta(m, token))
             )
+            if token != self._consulta_id:          # cancelada o reemplazada: no tocar nada
+                return
             filas.extend(f)
             errores.extend(e)
             has_more_global = has_more_global or has_more
@@ -1282,48 +1309,47 @@ class AppSECOP(Tk):
                 if filas and any(row.get("estado") != "SIN CONTRATOS" for row in filas):
                     nuevas_entidades.append((ent_key, ent_nit))
 
-        self._omitidos = list(query_local.omitidos)
-        self.after(0, lambda: self._mostrar_resultados_pagina(
-            filas, detalle, errores, has_more_global, offset,
-            nuevas_empresas, nuevas_entidades))
+        if token != self._consulta_id:
+            return
+        # Los omitidos viajan con el resultado: el hilo no escribe estado de la UI
+        omitidos = list(query_local.omitidos)
+
+        def entregar():
+            # Se revisa de nuevo en el hilo de la UI: una cancelacion pudo llegar despues
+            # de la comprobacion anterior y antes de que este callback se ejecute.
+            if token != self._consulta_id:
+                return
+            self._mostrar_resultados_pagina(
+                filas, detalle, errores, has_more_global, offset,
+                nuevas_empresas, nuevas_entidades, omitidos)
+        self.after(0, entregar)
+
+    def _progreso_consulta(self, msg, token):
+        if token == self._consulta_id:
+            self.lbl_estado.config(text=msg)
 
     def _mostrar_resultados_pagina(self, filas, detalle, errores, has_more, offset,
-                                    nuevas_empresas, nuevas_entidades):
+                                    nuevas_empresas, nuevas_entidades, omitidos=None):
         self._errores.extend(errores)
         self._has_more = has_more
-
-        # Acumular total estimado
-        if offset == 0:
-            self._total_estimado = len(filas)
-            self._detalle_cache = detalle
-        else:
-            self._total_estimado += len(filas)
-            for k, v in detalle.items():
-                if k not in self._detalle_cache:
-                    self._detalle_cache[k] = []
-                self._detalle_cache[k].extend(v)
+        self._pagina_detalle = detalle          # solo la pagina actual; no se acumula
+        if omitidos is not None:                # None: pagina servida desde la cache
+            self._omitidos = omitidos
 
         # Actualizar historiales
         if nuevas_empresas or nuevas_entidades:
             self._actualizar_historiales(nuevas_empresas, nuevas_entidades)
 
+        # Las ultimas paginas se guardan para revisitarlas sin consultar la API
+        self._cache.guardar(self._pagina_actual, (filas, detalle, [], has_more))
+
         # Renderizar pagina
         self._filas = filas  # Solo la pagina actual en memoria de UI
         self._renderizar_tabla_lazy(filas, offset)
-
-        # Tabs de detalle (solo en primera pagina; en paginas siguientes no recreamos)
-        if offset == 0:
-            for nombre, frm in list(self._tabs_detalle.items()):
-                self.notebook.forget(frm)
-            self._tabs_detalle.clear()
-            for tab_nombre, tab_data in detalle.items():
-                frm = ttk.Frame(self.notebook)
-                self.notebook.add(frm, text=f"  {tab_nombre}  ")
-                self._tabs_detalle[tab_nombre] = frm
-                self._construir_tab_detalle(frm, tab_nombre, tab_data)
-            self.notebook.select(self._tab_resumen)
+        self._reconstruir_tabs_detalle(detalle)
 
         self._set_consultando(False)
+        self._actualizar_barra_paginacion()
 
         # Status
         total_visible = len([f for f in filas if f["fuente"] != "—"])
@@ -1339,8 +1365,10 @@ class AppSECOP(Tk):
             msg += "  |  Omitidos (filtro no soportado): " + ", ".join(self._omitidos)
         self.lbl_estado.config(text=msg)
 
-        if offset == 0 and self._errores:
+        if errores and offset == 0:
             self._mostrar_errores()
+        if offset == 0 and self._conteos is None and self._filtros_activos:
+            self._iniciar_conteo()
 
     def _actualizar_historiales(self, nuevas_empresas, nuevas_entidades):
         """Agrega empresas/entidades nuevas al historial y refresca los combos."""
@@ -1428,34 +1456,10 @@ class AppSECOP(Tk):
                   style="Meta.TLabel").grid(row=2, column=0, sticky="w", pady=(2, 0))
 
     def _renderizar_tabla_lazy(self, filas, offset):
-        """Renderiza la pagina actual con controles de navegacion lazy."""
+        """Renderiza SOLO la pagina actual."""
         self.tree.delete(*self.tree.get_children())
         self._url_map = {}
         self._filas_por_item = {}
-
-        total_en_pagina = len(filas)
-        if total_en_pagina == 0:
-            self._pag_frm.grid_remove()
-            return
-
-        # Mostrar controles si hay mas de una pagina posible
-        if self._pagina_actual > 1 or self._has_more:
-            self._pag_frm.grid()
-        else:
-            self._pag_frm.grid_remove()
-
-        # Actualizar label (no sabemos el total exacto, solo estimado)
-        rango_ini = (self._pagina_actual - 1) * self._filas_por_pagina + 1
-        rango_fin = rango_ini + total_en_pagina - 1
-        total_txt = f"{self._total_estimado}+" if self._has_more else str(self._total_estimado)
-        self.lbl_pag.config(
-            text=f"Pagina {self._pagina_actual}  ({rango_ini}-{rango_fin} de ~{total_txt} registros)")
-
-        # Botones
-        self.btn_first.config(state="normal" if self._pagina_actual > 1 else "disabled")
-        self.btn_prev.config(state="normal" if self._pagina_actual > 1 else "disabled")
-        self.btn_next.config(state="normal" if self._has_more else "disabled")
-        self.btn_last.config(state="disabled")  # No sabemos cual es la ultima en lazy loading
 
         for i, fila in enumerate(filas, start=offset):
             vals = [texto_pantalla(fila.get(c, ""), 80) if c == "objeto" else fila.get(c, "")
@@ -1476,29 +1480,129 @@ class AppSECOP(Tk):
             if fila.get("url"):
                 self._url_map[item] = fila["url"]
 
-    def _cambiar_pagina(self, pagina):
-        if not self._filtros_activos or self._consultando:
+    def _cambiar_pagina(self, pagina, forzar=False):
+        if not self._filtros_activos or self._consultando or pagina < 1:
             return
-        if pagina < 1:
+        if pagina == self._pagina_actual and not forzar:
             return
-        if pagina == self._pagina_actual:
+        if self._total_paginas and pagina > self._total_paginas:
             return
-
-        filtros = self._filtros_activos
-        offset = (pagina - 1) * self._filas_por_pagina
+        self._pagina_previa = self._pagina_actual
         self._pagina_actual = pagina
+        offset = (pagina - 1) * self._filas_por_pagina
+        en_cache = self._cache.obtener(pagina)
+        if en_cache is not None:
+            filas, detalle, _errores, has_more = en_cache
+            self._mostrar_resultados_pagina(filas, detalle, [], has_more, offset, [], [])
+            return
         self._errores = []
         self._set_consultando(True)
-
+        filtros = self._filtros_activos
         threading.Thread(
             target=self._hilo_consulta,
-            args=(filtros["empresas"], filtros["filtros"], offset),
+            args=(filtros["empresas"], filtros["filtros"], offset, self._consulta_id),
             daemon=True,
         ).start()
 
     def _ultima_pagina(self):
-        # En lazy loading no sabemos la ultima; deshabilitado visualmente
-        pass
+        if self._total_paginas:
+            self._cambiar_pagina(self._total_paginas)
+
+    def _ir_a_pagina(self):
+        try:
+            pagina = int(self.ent_ir.get().strip())
+        except ValueError:
+            messagebox.showwarning("Ir a pagina", "Escriba un numero de pagina.")
+            return
+        if self._total_paginas:
+            pagina = min(pagina, self._total_paginas)
+        self._cambiar_pagina(max(1, pagina))
+
+    def _on_tamano(self):
+        nuevo = int(self.var_tamano.get())
+        if nuevo == self._filas_por_pagina:
+            return
+        self._filas_por_pagina = nuevo
+        self._cache.vaciar()
+        if self._conteos:
+            self._total_paginas = total_paginas(self._conteos, nuevo)
+        if self._filtros_activos and not self._consultando:
+            self._cambiar_pagina(1, forzar=True)
+
+    def _actualizar_barra_paginacion(self):
+        pag, total = self._pagina_actual, self._total_paginas
+        hay_siguiente = self._has_more or bool(total and pag < total)
+        if pag > 1 or hay_siguiente or (total and total > 1):
+            self._pag_frm.grid()
+        else:
+            self._pag_frm.grid_remove()
+        if total:
+            aprox = f"{total_registros(self._conteos):,}".replace(",", ".")
+            pos = f"{pag} de {total} (≈{aprox} registros)"
+        else:
+            pos = f"{pag}{'+' if self._has_more else ''}"
+        self.lbl_pag.config(
+            text=f"Pagina {pos}  |  hasta {self._filas_por_pagina} por dataset  |  {len(self._filas)} filas")
+        self.btn_first.config(state="normal" if pag > 1 else "disabled")
+        self.btn_prev.config(state="normal" if pag > 1 else "disabled")
+        self.btn_next.config(state="normal" if hay_siguiente else "disabled")
+        self.btn_last.config(state="normal" if total and pag < total else "disabled")
+
+    # ---- total real en segundo plano -------------------------------------
+    def _iniciar_conteo(self):
+        f = self._filtros_activos
+        threading.Thread(target=self._hilo_contar,
+                         args=(f["empresas"], f["filtros"], self._consulta_id),
+                         daemon=True).start()
+
+    def _hilo_contar(self, empresas, filtros, token):
+        query = SECOPQuery(SECOPClient(self.creds))
+        total = {}
+        try:
+            for nombre, nit in empresas.items():
+                for ds, n in query.contar(nombre, nit, filtros).items():
+                    total[ds] = total.get(ds, 0) + n
+        except Exception:
+            return                     # sin total: se conserva la paginacion "estimada" (N+)
+        self.after(0, lambda: self._aplicar_conteos(total, token))
+
+    def _aplicar_conteos(self, conteos, token):
+        if token != self._consulta_id:
+            return
+        self._conteos = conteos
+        self._total_paginas = total_paginas(conteos, self._filas_por_pagina)
+        self._actualizar_barra_paginacion()
+
+    # ---- pestañas de detalle: se reconstruyen por pagina -------------------
+    def _destruir_tabs_detalle(self):
+        for frm in list(self._tabs_detalle.values()):
+            self.notebook.forget(frm)
+            frm.destroy()              # forget() solo oculta: sin destroy() quedan en memoria
+        self._tabs_detalle.clear()
+
+    def _reconstruir_tabs_detalle(self, detalle):
+        seleccionada = self.notebook.select()
+        actual = self.notebook.tab(seleccionada, "text").strip() if seleccionada else ""
+        self._destruir_tabs_detalle()
+        for tab_nombre, tab_data in detalle.items():
+            frm = ttk.Frame(self.notebook)
+            self.notebook.add(frm, text=f"  {tab_nombre}  ")
+            self._tabs_detalle[tab_nombre] = frm
+            self._construir_tab_detalle(frm, tab_nombre, tab_data)
+        destino = self._tabs_detalle.get(actual)
+        self.notebook.select(destino if destino is not None else self._tab_resumen)
+
+    # ---- cancelacion -------------------------------------------------------
+    def _cancelar_operacion(self):
+        self._consulta_id += 1         # lo que llegue de una consulta en vuelo se descarta
+        self._cancelar.set()           # las exportaciones largas revisan este evento
+        if self._consultando:
+            if self._pagina_previa:
+                self._pagina_actual = self._pagina_previa
+            if not self._filas:
+                self._filtros_activos = None
+            self._set_consultando(False)
+        self.lbl_estado.config(text="Operacion cancelada.")
 
     def _ordenar(self, col):
         # En lazy loading solo se ordena la pagina visible, por tipo real
@@ -1571,6 +1675,8 @@ class AppSECOP(Tk):
         self.entry_unspsc.config(state=state)
         self.entry_entidad_nombre.config(state=state)
         self.entry_entidad_nit.config(state=state)
+        self.btn_cancelar.config(state="normal" if activo else "disabled")
+        self.combo_tamano.config(state="disabled" if activo else "readonly")
         if activo:
             self.progress.grid()
             self.progress.start(12)
@@ -1683,6 +1789,7 @@ class AppSECOP(Tk):
         state = "disabled" if activo else "normal"
         self.btn_excel.config(state=state)
         self.btn_csv.config(state=state)
+        self.btn_cancelar.config(state="normal" if activo else "disabled")
         if activo:
             self.progress.grid()
             self.progress.start(12)
@@ -1698,15 +1805,15 @@ class AppSECOP(Tk):
         self._filas = []
         self._url_map = {}
         self._filas_por_item = {}
-        self._detalle_cache = {}
+        self._pagina_detalle = {}
+        self._cache.vaciar()
+        self._conteos = None
+        self._total_paginas = None
         self._pagina_actual = 1
-        self._total_estimado = 0
         self._has_more = False
         self._filtros_activos = None
         self._pag_frm.grid_remove()
-        for nombre, frm in list(self._tabs_detalle.items()):
-            self.notebook.forget(frm)
-        self._tabs_detalle.clear()
+        self._destruir_tabs_detalle()
 
     def _limpiar(self):
         self._limpiar_tabla()
