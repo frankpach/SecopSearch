@@ -188,3 +188,71 @@ def test_error_no_borra_un_archivo_preexistente_si_no_llego_a_escribir(tmp_path)
     with pytest.raises(RuntimeError):
         exportar_incremental("csv", ["a"], str(ruta), paginas())
     assert ruta.read_text(encoding="utf-8") == "conservar"
+
+
+# --- no tocar archivos preexistentes ---------------------------------------
+def _cancela_escribiendo():
+    llamadas = {"n": 0}
+
+    def cancelado():
+        llamadas["n"] += 1
+        return llamadas["n"] > 3
+    return cancelado
+
+
+@pytest.mark.parametrize("formato,ext", [("xlsx", "xlsx"), ("csv", "csv"), ("json", "json")])
+def test_cancelar_escribiendo_conserva_archivo_previo(tmp_path, formato, ext):
+    ruta = tmp_path / f"previo.{ext}"
+    ruta.write_bytes(b"original")
+    filas = [{"a": str(i)} for i in range(2500)]
+    with pytest.raises(ExportacionCancelada):
+        exportar_incremental(formato, ["a"], str(ruta), iter([(filas, {})]),
+                             cancelado=_cancela_escribiendo())
+    assert ruta.read_bytes() == b"original"
+    assert [p.name for p in tmp_path.iterdir()] == [ruta.name]
+
+
+@pytest.mark.parametrize("formato,ext", [("xlsx", "xlsx"), ("csv", "csv"), ("json", "json")])
+def test_exito_reemplaza_archivo_previo_sin_dejar_part(tmp_path, formato, ext):
+    ruta = tmp_path / f"previo.{ext}"
+    ruta.write_bytes(b"original")
+    archivos, _ = exportar_incremental(formato, ["a"], str(ruta), iter([([{"a": "1"}], {})]))
+    assert archivos == [str(ruta)] and ruta.read_bytes() != b"original"
+    assert [p.name for p in tmp_path.iterdir()] == [ruta.name]
+
+
+def test_csv_dataset_no_sobrescribe_existentes(tmp_path):
+    previo = tmp_path / "SECOP_Resumen_s.csv"
+    previo.write_text("conservar", encoding="utf-8")
+    rutas = exportar("csv_dataset", ["a"], [{"a": "1"}], str(tmp_path), sello="s")
+    assert previo.read_text(encoding="utf-8") == "conservar"
+    assert len(rutas) == 1 and rutas[0] != str(previo) and os.path.exists(rutas[0])
+
+
+def test_csv_dataset_cancelar_limpia_lo_creado(tmp_path):
+    filas = [{"a": str(i)} for i in range(2500)]
+    detalle = {"D": [{"b": str(i)} for i in range(2500)]}
+    llamadas = {"n": 0}
+
+    def cancelado():
+        llamadas["n"] += 1
+        return llamadas["n"] > 5   # resumen se escribe completo; cancela en el detalle
+    with pytest.raises(ExportacionCancelada):
+        exportar_incremental("csv_dataset", ["a"], str(tmp_path), iter([(filas, detalle)]),
+                             sello="s", cancelado=cancelado)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_cierra_el_generador_de_paginas(tmp_path):
+    estado = {"cerrado": False}
+
+    def paginas():
+        try:
+            yield [{"a": "1"}], {}
+            yield [{"a": "2"}], {}
+        finally:
+            estado["cerrado"] = True
+    with pytest.raises(ExportacionCancelada):
+        exportar_incremental("csv", ["a"], str(tmp_path / "g.csv"), paginas(),
+                             cancelado=lambda: True)
+    assert estado["cerrado"]

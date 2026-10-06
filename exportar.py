@@ -13,7 +13,7 @@ from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 
-from tabla_utils import parse_fecha, parse_pesos, valor_crudo
+from tabla_utils import parse_fecha, valor_crudo
 
 _ILEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 _NUM_RE = re.compile(r"^-?\d+(\.\d+)?$")
@@ -155,7 +155,7 @@ def _hoja_xlsx(wb, nombre, columnas, encabezados, filas, col_url, cancelado):
 def _ruta_csv(carpeta, nombre, sello, creados):
     limpio = re.sub(r"[^\w\-]+", "_", nombre, flags=re.UNICODE).strip("_")[:40] or "datos"
     ruta, i = os.path.join(carpeta, f"SECOP_{limpio}_{sello}.csv"), 2
-    while ruta in creados:
+    while ruta in creados or os.path.exists(ruta):
         ruta = os.path.join(carpeta, f"SECOP_{limpio}_{sello}_{i}.csv")
         i += 1
     return ruta
@@ -171,7 +171,7 @@ def exportar_incremental(formato, columnas, destino, paginas, titulos=None,
         raise ValueError(f"Formato desconocido: {formato}")
     cancelado = cancelado or (lambda: False)
     titulos = titulos or {}
-    resumen, detalles, creados = _Spool(), {}, []
+    resumen, detalles, partes, finales, wb = _Spool(), {}, [], [], None
     try:
         for filas, detalle in paginas:
             if cancelado():
@@ -179,7 +179,9 @@ def exportar_incremental(formato, columnas, destino, paginas, titulos=None,
             resumen.agregar(filas)
             for nombre, datos in (detalle or {}).items():
                 if datos:
-                    detalles.setdefault(nombre, _Spool()).agregar(datos)
+                    if nombre not in detalles:
+                        detalles[nombre] = _Spool()
+                    detalles[nombre].agregar(datos)
         if cancelado():
             raise ExportacionCancelada()
         if resumen.n == 0:
@@ -187,7 +189,8 @@ def exportar_incremental(formato, columnas, destino, paginas, titulos=None,
         enc = [titulos.get(c, c) for c in columnas]
 
         if formato == "xlsx":
-            creados.append(destino)
+            parte = destino + ".part"
+            partes.append(parte)
             wb = Workbook(write_only=True)
             usados = set()
             _hoja_xlsx(wb, nombre_hoja("Resumen", usados), columnas, enc, resumen.filas(),
@@ -196,31 +199,43 @@ def exportar_incremental(formato, columnas, destino, paginas, titulos=None,
                 cols = list(sp.columnas)
                 _hoja_xlsx(wb, nombre_hoja(nombre, usados), cols, cols, sp.filas(),
                            _col_url(cols), cancelado)
-            wb.save(destino)
-        elif formato == "csv":
-            creados.append(destino)
-            _escribir_csv(destino, columnas, enc, resumen.filas(), delimitador, cancelado)
-        elif formato == "json":
-            creados.append(destino)
-            _escribir_json(destino, columnas, resumen.filas(), cancelado)
+            wb.save(parte)
+            os.replace(parte, destino)
+            finales.append(destino)
+        elif formato in ("csv", "json"):
+            parte = destino + ".part"
+            partes.append(parte)
+            if formato == "csv":
+                _escribir_csv(parte, columnas, enc, resumen.filas(), delimitador, cancelado)
+            else:
+                _escribir_json(parte, columnas, resumen.filas(), cancelado)
+            os.replace(parte, destino)
+            finales.append(destino)
         else:  # csv_dataset: `destino` es una carpeta
-            ruta = _ruta_csv(destino, "Resumen", sello, creados)
-            creados.append(ruta)
-            _escribir_csv(ruta, columnas, enc, resumen.filas(), delimitador, cancelado)
-            for nombre, sp in detalles.items():
-                cols = list(sp.columnas)
-                ruta = _ruta_csv(destino, nombre, sello, creados)
-                creados.append(ruta)
-                _escribir_csv(ruta, cols, cols, sp.filas(), delimitador, cancelado)
-        return list(creados), resumen.n
+            trabajos = [("Resumen", columnas, enc, resumen)]
+            trabajos += [(n, list(sp.columnas), list(sp.columnas), sp)
+                         for n, sp in detalles.items()]
+            for nombre, cols, encs, sp in trabajos:
+                ruta = _ruta_csv(destino, nombre, sello, finales)
+                parte = ruta + ".part"
+                partes.append(parte)
+                _escribir_csv(parte, cols, encs, sp.filas(), delimitador, cancelado)
+                os.replace(parte, ruta)
+                finales.append(ruta)
+        return list(finales), resumen.n
     except BaseException:
-        for ruta in creados:
+        for ruta in partes + finales:
             try:
                 os.remove(ruta)
             except OSError:
                 pass
         raise
     finally:
+        if wb is not None:
+            wb.close()
+        cerrar = getattr(paginas, "close", None)
+        if cerrar:
+            cerrar()
         resumen.cerrar()
         for sp in detalles.values():
             sp.cerrar()
