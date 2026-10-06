@@ -152,6 +152,19 @@ def _hoja_xlsx(wb, nombre, columnas, encabezados, filas, col_url, cancelado):
         ws.append(celdas)
 
 
+def _cerrar_libro(wb):
+    """Cierra los generadores de filas pendientes de openpyxl mientras su archivo
+    sigue abierto (evita 'Exception ignored' al recolectarlos tras wb.close())."""
+    for ws in wb._sheets:
+        filas = getattr(ws, "_rows", None)
+        if filas is not None and hasattr(filas, "close"):
+            try:
+                filas.close()
+            except Exception:
+                pass
+    wb.close()
+
+
 def _ruta_csv(carpeta, nombre, sello, creados):
     limpio = re.sub(r"[^\w\-]+", "_", nombre, flags=re.UNICODE).strip("_")[:40] or "datos"
     ruta, i = os.path.join(carpeta, f"SECOP_{limpio}_{sello}.csv"), 2
@@ -232,7 +245,7 @@ def exportar_incremental(formato, columnas, destino, paginas, titulos=None,
         raise
     finally:
         if wb is not None:
-            wb.close()
+            _cerrar_libro(wb)
         cerrar = getattr(paginas, "close", None)
         if cerrar:
             cerrar()
