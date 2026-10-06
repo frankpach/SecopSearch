@@ -29,6 +29,8 @@ import requests
 from search import (
     Filtros, condiciones, orden_dataset, primer_valor_positivo, url_de,
     construir_where as _build_where, escapar_soql as _escape_sql, resolver_nombre_oficial,
+    RANGOS, MODO_PERSONALIZADO, ETIQUETA_PERSONALIZADO, RANGO_POR_DEFECTO, rango_predefinido,
+    con_rango, descripcion_rango, identificar_fila, marcar_nuevas,
 )
 from storage import Directorio, DuplicadoError
 from ui_directorio import DialogoBuscarEmpresa, VentanaDirectorio, error_guardado
@@ -527,6 +529,8 @@ COLUMNAS_EXPORTACION = COLUMNAS + [
 
 COLS_IDS = [c[0] for c in COLUMNAS]
 
+PAGINA_NOVEDADES = 100     # tamano fijo al ejecutar busquedas guardadas (comparacion consistente)
+
 
 class AppSECOP(Tk):
     def __init__(self):
@@ -556,6 +560,8 @@ class AppSECOP(Tk):
         self._filas_por_item = {}
         self._errores = []
         self._omitidos = []
+        self._nuevos = set()           # filas nuevas desde la ultima ejecucion de una busqueda guardada
+        self._busqueda_activa = None   # id de la busqueda guardada que se esta ejecutando
         self._consultando = False
         self._exportando = False       # consulta y exportacion son excluyentes
 
@@ -589,6 +595,7 @@ class AppSECOP(Tk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
         self.after(300, self._cargar_metadatos_async)
+        self.after(1500, self._aviso_inicio)
 
     # -------------------------------------------------------------------------
     # ESTILOS
@@ -701,6 +708,8 @@ class AppSECOP(Tk):
         self.progress.grid(row=0, column=6, rowspan=3, sticky="w", padx=(12, 0))
         self.progress.grid_remove()
 
+        self._crear_panel_busqueda_avanzada(frm)
+
     def _refrescar_combo_empresas(self):
         self._ids_combo["empresas"] = {k: it["id"] for k, it in self.directorio.claves("empresas").items()}
         self.combo_empresa["values"] = ["TODAS"] + list(self._ids_combo["empresas"])
@@ -708,6 +717,172 @@ class AppSECOP(Tk):
     def _refrescar_combo_entidades(self):
         self._ids_combo["entidades"] = {k: it["id"] for k, it in self.directorio.claves("entidades").items()}
         self.combo_entidad["values"] = ["TODAS"] + list(self._ids_combo["entidades"])
+
+    MODALIDADES = ["Contratación directa", "Licitación pública", "Selección abreviada",
+                   "Concurso de méritos", "Mínima cuantía", "Régimen especial"]
+
+    def _crear_panel_busqueda_avanzada(self, frm):
+        # --- Fila 3: texto libre + buscar empresa + filtros avanzados ---
+        ttk.Label(frm, text="Texto del objeto:").grid(row=3, column=0, sticky="w", padx=(0, 4), pady=(6, 0))
+        self.entry_texto = ttk.Entry(frm, width=45)
+        self.entry_texto.grid(row=3, column=1, sticky="w", padx=(0, 4), pady=(6, 0))
+        self.entry_texto.bind("<Return>", lambda e: self._iniciar_consulta())
+        ttk.Button(frm, text="Buscar empresa por nombre...",
+                   command=self._abrir_buscar_empresa).grid(row=3, column=2, columnspan=2,
+                                                            sticky="w", padx=(0, 12), pady=(6, 0))
+        self.var_avanzado = BooleanVar(value=False)
+        ttk.Checkbutton(frm, text="Filtros avanzados", variable=self.var_avanzado,
+                        command=self._toggle_avanzado).grid(row=3, column=4, sticky="w", pady=(6, 0))
+
+        # --- Fila 4: rango de fechas (SIEMPRE visible; por defecto el ultimo año) ---
+        ttk.Label(frm, text="Fechas:").grid(row=4, column=0, sticky="w", padx=(0, 4), pady=(6, 0))
+        fr = ttk.Frame(frm)
+        fr.grid(row=4, column=1, columnspan=5, sticky="w", pady=(6, 0))
+        self.var_rango = StringVar(value=RANGOS["ultimo_anio"][0])
+        self.combo_rango = ttk.Combobox(
+            fr, textvariable=self.var_rango, state="readonly", width=20,
+            values=[etiqueta for etiqueta, _ in RANGOS.values()] + [ETIQUETA_PERSONALIZADO])
+        self.combo_rango.pack(side="left")
+        self.combo_rango.bind("<<ComboboxSelected>>", lambda e: self._on_rango())
+        ttk.Label(fr, text="   Desde:").pack(side="left")
+        self.ent_desde = ttk.Entry(fr, width=12)
+        self.ent_desde.pack(side="left", padx=(2, 8))
+        ttk.Label(fr, text="Hasta:").pack(side="left")
+        self.ent_hasta = ttk.Entry(fr, width=12)
+        self.ent_hasta.pack(side="left", padx=(2, 8))
+        for e in (self.ent_desde, self.ent_hasta):
+            e.bind("<KeyRelease>", lambda ev: self._on_fecha_editada())
+        ttk.Label(fr, text="AAAA-MM-DD; vacio = sin limite. Sanciones y SIRI no usan fechas.",
+                  style="Meta.TLabel").pack(side="left")
+        self._on_rango()
+
+        # --- Fila 5: filtros avanzados (plegable) ---
+        self.frm_avanzado = ttk.Frame(frm)
+        self.frm_avanzado.grid(row=5, column=0, columnspan=6, sticky="w", pady=(6, 0))
+        self.ent_av = {}
+        campos = [("valor_min", "Valor min:", 14), ("valor_max", "Valor max:", 14),
+                  ("estado", "Estado:", 14), ("departamento", "Departamento:", 14)]
+        for i, (clave, etiqueta, ancho) in enumerate(campos):
+            ttk.Label(self.frm_avanzado, text=etiqueta).grid(row=0, column=i * 2, sticky="w", padx=(0, 2))
+            e = ttk.Entry(self.frm_avanzado, width=ancho)
+            e.grid(row=0, column=i * 2 + 1, sticky="w", padx=(0, 10))
+            self.ent_av[clave] = e
+        ttk.Label(self.frm_avanzado, text="Modalidad:").grid(row=0, column=8, sticky="w", padx=(0, 2))
+        self.var_modalidad = StringVar()
+        self.combo_modalidad = ttk.Combobox(self.frm_avanzado, textvariable=self.var_modalidad,
+                                            values=self.MODALIDADES, width=24)
+        self.combo_modalidad.grid(row=0, column=9, sticky="w")
+        self.frm_avanzado.grid_remove()
+
+        # --- Fila 6: busquedas guardadas ---
+        ttk.Label(frm, text="Busquedas guardadas:").grid(row=6, column=0, sticky="w", padx=(0, 4), pady=(6, 0))
+        self.var_busqueda = StringVar()
+        self.combo_busqueda = ttk.Combobox(frm, textvariable=self.var_busqueda, state="readonly", width=42)
+        self.combo_busqueda.grid(row=6, column=1, sticky="w", padx=(0, 4), pady=(6, 0))
+        acc = ttk.Frame(frm)
+        acc.grid(row=6, column=2, columnspan=4, sticky="w", pady=(6, 0))
+        for texto, cmd in (("Ejecutar", self._ejecutar_busqueda_guardada),
+                           ("Ejecutar todas", self._ejecutar_todas),
+                           ("Guardar actual...", self._guardar_busqueda),
+                           ("Eliminar", self._eliminar_busqueda)):
+            ttk.Button(acc, text=texto, command=cmd).pack(side="left", padx=2)
+        self._refrescar_combo_busquedas()
+
+    def _toggle_avanzado(self):
+        if self.var_avanzado.get():
+            self.frm_avanzado.grid()
+        else:
+            self.frm_avanzado.grid_remove()
+
+    def _refrescar_combo_busquedas(self):
+        self.combo_busqueda["values"] = [b["nombre"] for b in self.directorio.listar_busquedas()]
+
+    def _abrir_buscar_empresa(self):
+        DialogoBuscarEmpresa(self, self._client_nuevo, self.directorio,
+                             self._usar_proveedor, self._refrescar_combos)
+
+    def _usar_proveedor(self, nit, nombre):
+        self.var_empresa.set("TODAS")
+        self.entry_nit.delete(0, "end")
+        self.entry_nit.insert(0, nit)
+        self.lbl_estado.config(text=f"Proveedor seleccionado: {nombre} ({nit})")
+
+    # ---- rango de fechas -------------------------------------------------
+    @staticmethod
+    def _poner(entry, valor):
+        entry.delete(0, "end")
+        entry.insert(0, valor)
+
+    def _clave_rango_actual(self):
+        etiqueta = self.var_rango.get()
+        return next((k for k, (e, _) in RANGOS.items() if e == etiqueta), MODO_PERSONALIZADO)
+
+    def _on_rango(self):
+        """Elegir un rango predefinido rellena Desde/Hasta (se recalculan en cada consulta)."""
+        clave = self._clave_rango_actual()
+        if clave != MODO_PERSONALIZADO:
+            desde, hasta = rango_predefinido(clave)
+            self._poner(self.ent_desde, desde)
+            self._poner(self.ent_hasta, hasta)
+
+    def _on_fecha_editada(self):
+        self.var_rango.set(ETIQUETA_PERSONALIZADO)
+
+    def _leer_rango(self):
+        clave = self._clave_rango_actual()
+        if clave == MODO_PERSONALIZADO:
+            return {"modo": MODO_PERSONALIZADO, "desde": self.ent_desde.get().strip(),
+                    "hasta": self.ent_hasta.get().strip()}
+        return {"modo": clave}
+
+    def _aplicar_rango_a_widgets(self, rango):
+        rango = rango or RANGO_POR_DEFECTO
+        modo = rango.get("modo", "ultimo_anio")
+        if modo == MODO_PERSONALIZADO:
+            self.var_rango.set(ETIQUETA_PERSONALIZADO)
+            self._poner(self.ent_desde, rango.get("desde", ""))
+            self._poner(self.ent_hasta, rango.get("hasta", ""))
+        else:
+            self.var_rango.set(RANGOS.get(modo, RANGOS["ultimo_anio"])[0])
+            self._on_rango()
+
+    # ---- filtros: widgets <-> Filtros ------------------------------------
+    def _leer_filtros(self):
+        nit_manual = self.entry_nit.get().strip()
+        empresa_sel = self.var_empresa.get()
+        nit_prov = nit_manual or (self.empresas.get(empresa_sel) or "" if empresa_sel != "TODAS" else "")
+        entidad_nombre = self.entry_entidad_nombre.get().strip()
+        entidad_nit = self.entry_entidad_nit.get().strip()
+        entidad_sel = self.var_entidad.get()
+        if entidad_sel != "TODAS" and entidad_sel in self.entidades:
+            entidad_nombre = entidad_nombre or entidad_sel
+            entidad_nit = entidad_nit or self.entidades[entidad_sel]
+        if self._clave_rango_actual() != MODO_PERSONALIZADO:
+            self._on_rango()               # un rango predefinido siempre se recalcula a "hoy"
+        base = Filtros(
+            texto=self.entry_texto.get(), nit_proveedor=nit_prov,
+            entidad_nombre=entidad_nombre, entidad_nit=entidad_nit,
+            unspsc=self.entry_unspsc.get(), modalidad=self.var_modalidad.get(),
+            **{k: e.get() for k, e in self.ent_av.items()},
+        )
+        return con_rango(base, self._leer_rango())
+
+    def _cargar_filtros_en_widgets(self, f, rango=None):
+        self._poner(self.entry_texto, f.texto)
+        self._poner(self.entry_nit, f.nit_proveedor)
+        self.var_empresa.set("TODAS")
+        self.var_entidad.set("TODAS")
+        self._poner(self.entry_entidad_nombre, f.entidad_nombre)
+        self._poner(self.entry_entidad_nit, f.entidad_nit)
+        self._poner(self.entry_unspsc, f.unspsc)
+        self.var_modalidad.set(f.modalidad)
+        for clave, entry in self.ent_av.items():
+            self._poner(entry, getattr(f, clave))
+        self._aplicar_rango_a_widgets(rango)
+        avanzado = any(getattr(f, k) for k in ("valor_min", "valor_max", "estado",
+                                                "departamento", "modalidad"))
+        self.var_avanzado.set(avanzado)
+        self._toggle_avanzado()
 
     # -------------------------------------------------------------------------
     # DIRECTORIO (storage.Directorio es la unica fuente de verdad)
@@ -980,6 +1155,10 @@ class AppSECOP(Tk):
         ttk.Button(self._pag_frm, text="Ir", width=3, command=self._ir_a_pagina).pack(side="left", padx=2)
         self._pag_frm.grid_remove()  # Oculto hasta que haya datos
 
+        self.lbl_rango = ttk.Label(parent, text="", style="Meta.TLabel")
+        self.lbl_rango.grid(row=4, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        self.tree.tag_configure("nuevo", background="#fff3b0")
+
     # -------------------------------------------------------------------------
     # PANEL MCP SERVER (HTTPS)
     # -------------------------------------------------------------------------
@@ -1249,47 +1428,15 @@ class AppSECOP(Tk):
     # -------------------------------------------------------------------------
     # CONSULTA PRINCIPAL
     # -------------------------------------------------------------------------
-    def _iniciar_consulta(self):
+    def _iniciar_consulta(self, busqueda_id=None):
         if self._consultando or self._exportando:
             return
 
         nit_manual = self.entry_nit.get().strip()
         empresa_sel = self.var_empresa.get()
-        unspsc = self.entry_unspsc.get().strip()
-        entidad_nombre = self.entry_entidad_nombre.get().strip()
-        entidad_nit = self.entry_entidad_nit.get().strip()
-        entidad_sel = self.var_entidad.get()
 
-        # Si selecciono entidad del dropdown y no hay campos llenos, autollenar
-        if entidad_sel != "TODAS" and entidad_sel in self.entidades:
-            if not entidad_nombre:
-                entidad_nombre = entidad_sel
-            if not entidad_nit:
-                entidad_nit = self.entidades[entidad_sel]
-
-        has_supplier = bool(nit_manual) or (empresa_sel != "TODAS")
-        has_filters = bool(unspsc or entidad_nombre or entidad_nit)
-
-        if not has_supplier and not has_filters:
-            messagebox.showwarning("Filtros vacios",
-                "Ingrese al menos un criterio: empresa/NIT de proveedor, UNSPSC, o entidad compradora.")
-            return
-
-        if nit_manual and not validar_nit(nit_manual):
-            messagebox.showwarning("NIT invalido",
-                "El NIT ingresado no es valido. Debe contener entre 8 y 11 digitos.")
-            return
-
-        if entidad_nit and not validar_nit(entidad_nit):
-            messagebox.showwarning("NIT entidad invalido",
-                "El NIT de la entidad no es valido.")
-            return
-
-        # Armar lista de empresas a consultar
-        nit_sel = ""
-        if nit_manual:
-            empresas = {nit_manual: nit_manual}
-        elif empresa_sel != "TODAS":
+        # La empresa del combo debe seguir en el directorio y tener NIT
+        if not nit_manual and empresa_sel != "TODAS":
             nit_sel = self.empresas.get(empresa_sel)
             if nit_sel is None:                 # ya no esta en el directorio
                 self._refrescar_combos()
@@ -1299,22 +1446,39 @@ class AppSECOP(Tk):
                 messagebox.showwarning("Empresa sin NIT",
                     f"'{empresa_sel}' no tiene NIT en el directorio. Agreguelo con Editar.")
                 return
-            empresas = {empresa_sel: nit_sel}
+
+        filtros = self._leer_filtros()          # ya con las fechas del rango calculadas
+
+        if filtros.vacio():                     # las fechas no cuentan como criterio
+            messagebox.showwarning("Filtros vacios",
+                "Ingrese al menos un criterio: empresa/NIT de proveedor, texto, UNSPSC, "
+                "entidad compradora o un filtro avanzado.")
+            return
+        if nit_manual and not validar_nit(nit_manual):
+            messagebox.showwarning("NIT invalido",
+                "El NIT ingresado no es valido. Debe contener entre 8 y 11 digitos.")
+            return
+        if filtros.entidad_nit and not validar_nit(filtros.entidad_nit):
+            messagebox.showwarning("NIT entidad invalido", "El NIT de la entidad no es valido.")
+            return
+        # Fechas escritas a mano, valores, etc.: condiciones() no los valida ni escapa
+        errores = filtros.errores()
+        if errores:
+            messagebox.showwarning("Filtros invalidos", "\n".join(errores))
+            return
+
+        # Armar lista de empresas a consultar
+        if nit_manual:
+            empresas = {nit_manual: nit_manual}
+        elif empresa_sel != "TODAS":
+            empresas = {empresa_sel: filtros.nit_proveedor}
         else:
             empresas = {None: None}  # Busqueda general
 
-        filtros = Filtros(
-            nit_proveedor=nit_manual or nit_sel,
-            unspsc=unspsc, entidad_nombre=entidad_nombre, entidad_nit=entidad_nit,
-        )
-        errs_filtros = filtros.errores()
-        if errs_filtros:
-            messagebox.showwarning("Filtros invalidos", "\n".join(errs_filtros))
-            return
-
-        self._limpiar_tabla()
+        self._limpiar_tabla()                   # tambien borra las marcas de nuevas
         # _limpiar_tabla() deja _filtros_activos en None: se asigna DESPUES
         self._filtros_activos = {"empresas": empresas, "filtros": filtros}
+        self._busqueda_activa = busqueda_id     # se compara con la ejecucion anterior en la pagina 1
         self._filas_por_pagina = int(self.var_tamano.get())
         self._consulta_id += 1
         self._cancelar.clear()
@@ -1323,6 +1487,8 @@ class AppSECOP(Tk):
         self._omitidos = []
         self._pagina_actual = 1
         self._has_more = False
+        self.lbl_rango.config(text=descripcion_rango(filtros)
+                              + "  (sanciones y SIRI: sin filtro de fechas)")
         self._set_consultando(True)
 
         threading.Thread(
@@ -1476,6 +1642,22 @@ class AppSECOP(Tk):
         if not errores:
             self._cache.guardar(self._pagina_actual, (filas, detalle, [], has_more))
 
+        # Busqueda guardada: solo la pagina 1 se compara con la ejecucion anterior, y antes
+        # de renderizar para que las marcas de nuevas esten listas
+        n_nuevos = 0
+        if offset == 0:
+            if errores and self._busqueda_activa:
+                # pagina incompleta: compararla daria falsas novedades la proxima vez
+                self._busqueda_activa = None
+                aviso_dir = "  |  ".join(filter(None, [
+                    aviso_dir, "Busqueda guardada sin registrar (hubo errores en la consulta)"]))
+            try:
+                n_nuevos = self._procesar_busqueda_guardada(filas)
+            except (OSError, KeyError) as e:    # se muestran los resultados igual
+                n_nuevos = len(self._nuevos)
+                aviso_dir = "  |  ".join(filter(None, [
+                    aviso_dir, f"No se pudo registrar la ejecucion de la busqueda: {e}"]))
+
         # Renderizar pagina
         self._filas = filas  # Solo la pagina actual en memoria de UI
         self._renderizar_tabla_lazy(filas, offset)
@@ -1488,6 +1670,10 @@ class AppSECOP(Tk):
         total_visible = len([f for f in filas if f["fuente"] != "—"])
         sanciones = len([f for f in filas if f["sancion"] == "SI"])
         msg = f"Pagina {self._pagina_actual} cargada: {total_visible} registros mostrados"
+        if n_nuevos:
+            msg += f"  |  {n_nuevos} NUEVO(S) desde la ultima ejecucion"
+        if self._filtros_activos:
+            msg += "  |  " + descripcion_rango(self._filtros_activos["filtros"])
         if self._has_more:
             msg += "  |  Hay mas paginas disponibles"
         if sanciones:
@@ -1610,6 +1796,8 @@ class AppSECOP(Tk):
                     tags.append(estado_tag)
                 else:
                     tags.append("par" if i % 2 == 0 else "impar")
+            if identificar_fila(fila) in self._nuevos:
+                tags = ["nuevo"]
             if fila.get("url"):
                 tags.append("con_url")
             item = self.tree.insert("", "end", values=vals, tags=tuple(tags))
@@ -1781,6 +1969,144 @@ class AppSECOP(Tk):
         self._renderizar_tabla_lazy(filas_ordenadas, (self._pagina_actual - 1) * self._filas_por_pagina)
 
     # -------------------------------------------------------------------------
+    # BUSQUEDAS GUARDADAS Y NOVEDADES
+    # -------------------------------------------------------------------------
+    def _procesar_busqueda_guardada(self, filas):
+        """Marca como NUEVAS las filas ausentes en la ejecucion anterior y registra esta.
+        Puede lanzar OSError si el directorio no se puede escribir (las marcas ya quedan)."""
+        busqueda_id, self._busqueda_activa = self._busqueda_activa, None
+        if not busqueda_id:                          # p. ej. al volver a la pagina 1 desde la cache
+            return len(self._nuevos)
+        self._nuevos = set()
+        b = self.directorio.obtener_busqueda(busqueda_id)
+        if b is None:
+            return 0
+        reales = [f for f in filas if f.get("fuente") != "—"]
+        if b["ultima_ejecucion"]:                    # la primera vez no se marca nada
+            self._nuevos = {identificar_fila(f) for f in marcar_nuevas(reales, b["ultimos_ids"])}
+        self.directorio.registrar_ejecucion(busqueda_id, [identificar_fila(f) for f in reales])
+        return len(self._nuevos)
+
+    def _guardar_busqueda(self):
+        filtros = self._leer_filtros()
+        if filtros.vacio():
+            messagebox.showwarning("Busqueda vacia", "Defina al menos un criterio antes de guardar.")
+            return
+        errores = filtros.errores()
+        if errores:
+            messagebox.showwarning("Filtros invalidos", "\n".join(errores))
+            return
+        nombre = simpledialog.askstring("Guardar busqueda", "Nombre de la busqueda:", parent=self)
+        if not nombre or not nombre.strip():
+            return
+        nombre = nombre.strip()
+        try:
+            # Se guarda el MODO del rango (p. ej. "ultimo_anio"), no las fechas calculadas
+            self.directorio.guardar_busqueda(nombre, filtros.a_dict(incluir_fechas=False),
+                                             self._leer_rango())
+        except OSError as e:
+            error_guardado(e)
+            return
+        self._refrescar_combo_busquedas()
+        self.var_busqueda.set(nombre)
+        self.lbl_estado.config(text=f"Busqueda '{nombre}' guardada.")
+
+    def _busqueda_elegida(self):
+        b = self.directorio.buscar_busqueda_por_nombre(self.var_busqueda.get())
+        if b is None:
+            messagebox.showwarning("Busqueda", "Seleccione una busqueda guardada.")
+        return b
+
+    def _ejecutar_busqueda_guardada(self):
+        if self._consultando or self._exportando:
+            return
+        b = self._busqueda_elegida()
+        if b is None:
+            return
+        self._cargar_filtros_en_widgets(Filtros.desde_dict(b["filtros"]), b.get("rango"))
+        self.var_tamano.set(str(PAGINA_NOVEDADES))   # tamano fijo: comparacion de novedades consistente
+        self._iniciar_consulta(busqueda_id=b["id"])
+        if not self._consultando:                    # no arranco (filtros invalidos): tamano previo
+            self.var_tamano.set(str(self._filas_por_pagina))
+
+    def _eliminar_busqueda(self):
+        b = self._busqueda_elegida()
+        if b is None or not messagebox.askyesno("Confirmar", f"Eliminar la busqueda '{b['nombre']}'?"):
+            return
+        try:
+            self.directorio.eliminar_busqueda(b["id"])
+        except KeyError:
+            pass
+        except OSError as e:
+            error_guardado(e)
+            return
+        self.var_busqueda.set("")
+        self._refrescar_combo_busquedas()
+
+    def _ejecutar_todas(self):
+        if self._consultando or self._exportando:
+            return
+        busquedas = [dict(b) for b in self.directorio.listar_busquedas()]   # copia para el hilo
+        if not busquedas:
+            messagebox.showinfo("Busquedas", "No hay busquedas guardadas.")
+            return
+        self._cancelar.clear()
+        self._pagina_previa = None                   # no hay cambio de pagina que deshacer
+        self._set_consultando(True)
+        threading.Thread(target=self._hilo_ejecutar_todas,
+                         args=(busquedas, self._consulta_id), daemon=True).start()
+
+    def _hilo_ejecutar_todas(self, busquedas, token):
+        """(Hilo de trabajo) Ejecuta la pagina 1 de cada busqueda y cuenta las novedades.
+        `token`: si _consulta_id cambia (Cancelar) se detiene y no toca la UI."""
+        query = SECOPQuery(SECOPClient(self.creds))
+        resumen = []
+        for b in busquedas:
+            if token != self._consulta_id or self._cancelar.is_set():
+                return
+            self.after(0, lambda n=b["nombre"]: self._progreso_consulta(f"Ejecutando '{n}'...", token))
+            # el rango se recalcula a "hoy" en cada ejecucion; las fechas guardadas se validan
+            filtros = con_rango(Filtros.desde_dict(b["filtros"]), b.get("rango"))
+            errores = filtros.errores() or (["sin criterios"] if filtros.vacio() else [])
+            if errores:
+                resumen.append(f"{b['nombre']}: filtros invalidos, no se ejecuto ({'; '.join(errores)})")
+                continue
+            # Igual que "Ejecutar" (que pone el NIT en el campo manual): mismas filas y mismos ids
+            nit = filtros.nit_proveedor or None
+            try:
+                filas, _, errs, _ = query.consultar_pagina(nit, nit, filtros, offset=0,
+                                                           page_size=PAGINA_NOVEDADES)
+                if errs:                             # pagina incompleta: no se registra
+                    resumen.append(f"{b['nombre']}: error ({errs[0]}); no se registro")
+                    continue
+                reales = [f for f in filas if f.get("fuente") != "—"]
+                primera = not b["ultima_ejecucion"]
+                nuevos = 0 if primera else len(marcar_nuevas(reales, b["ultimos_ids"]))
+                self.directorio.registrar_ejecucion(b["id"], [identificar_fila(f) for f in reales])
+                resumen.append(f"{b['nombre']}: " + ("primera ejecucion registrada"
+                                                      if primera else f"{nuevos} nuevo(s)"))
+            except Exception as e:                   # red, disco (OSError) o busqueda borrada
+                resumen.append(f"{b['nombre']}: error ({str(e) or type(e).__name__})")
+        self.after(0, lambda: self._fin_ejecutar_todas(resumen, token))
+
+    def _fin_ejecutar_todas(self, resumen, token):
+        if token != self._consulta_id:               # cancelada: la UI ya se restauro
+            return
+        self._set_consultando(False)
+        self.lbl_estado.config(text="Busquedas guardadas ejecutadas.")
+        messagebox.showinfo("Novedades de busquedas guardadas", "\n".join(resumen))
+
+    def _aviso_inicio(self):
+        if self.directorio.aviso:
+            messagebox.showwarning("Directorio", self.directorio.aviso)
+            self.directorio.aviso = ""               # se avisa una sola vez
+        n = len(self.directorio.listar_busquedas())
+        if n and messagebox.askyesno(
+                "Busquedas guardadas",
+                f"Hay {n} busqueda(s) guardada(s). ¿Ejecutarlas ahora para ver novedades?"):
+            self._ejecutar_todas()
+
+    # -------------------------------------------------------------------------
     # ACCIONES EN TABLA RESUMEN
     # -------------------------------------------------------------------------
     def _abrir_contrato(self, event=None):
@@ -1852,6 +2178,10 @@ class AppSECOP(Tk):
         self.entry_unspsc.config(state=state)
         self.entry_entidad_nombre.config(state=state)
         self.entry_entidad_nit.config(state=state)
+        self.entry_texto.config(state=state)
+        self.ent_desde.config(state=state)
+        self.ent_hasta.config(state=state)
+        self.combo_rango.config(state="disabled" if activo else "readonly")
         self.btn_cancelar.config(state="normal" if activo else "disabled")
         self.combo_tamano.config(state="disabled" if activo else "readonly")
         if activo:
@@ -1980,6 +2310,8 @@ class AppSECOP(Tk):
         self._pagina_actual = 1
         self._has_more = False
         self._filtros_activos = None
+        self._nuevos = set()
+        self.lbl_rango.config(text="")
         self._pag_frm.grid_remove()
         self._destruir_tabs_detalle()
 
@@ -1991,6 +2323,11 @@ class AppSECOP(Tk):
         self.entry_entidad_nit.delete(0, "end")
         self.var_empresa.set("TODAS")
         self.var_entidad.set("TODAS")
+        self.entry_texto.delete(0, "end")
+        for e in self.ent_av.values():
+            e.delete(0, "end")
+        self.var_modalidad.set("")
+        self._aplicar_rango_a_widgets(None)     # vuelve a "Ultimo año"
         self.lbl_estado.config(text="Resultados limpiados.")
 
 
