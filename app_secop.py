@@ -33,6 +33,9 @@ from search import (
 )
 from paginacion import CachePaginas, TAMANOS_PAGINA, TAMANO_POR_DEFECTO, total_paginas, total_registros
 from copiador_tabla import CopiadorTabla
+from exportar import ExportacionCancelada, exportar, exportar_incremental
+from paginacion import UMBRAL_CONFIRMACION, requiere_confirmacion
+from ui_exportar import DialogoExportar
 from tabla_utils import columnas_union, ordenar_filas, texto_pantalla, valor_visible
 
 # =============================================================================
@@ -569,6 +572,12 @@ COLUMNAS = [
     ("sancion",      "Sancion",          70),
 ]
 
+COLUMNAS_EXPORTACION = COLUMNAS + [
+    ("nit",        "NIT Empresa", 0),
+    ("referencia", "Referencia",  0),
+    ("url",        "URL SECOP",   0),
+]
+
 COLS_IDS = [c[0] for c in COLUMNAS]
 
 
@@ -594,6 +603,7 @@ class AppSECOP(Tk):
         self._errores = []
         self._omitidos = []
         self._consultando = False
+        self._exportando = False       # consulta y exportacion son excluyentes
 
         # Paginacion lazy loading: solo la pagina actual vive en memoria
         self._filas_por_pagina = TAMANO_POR_DEFECTO
@@ -713,10 +723,8 @@ class AppSECOP(Tk):
         self.btn_consultar = ttk.Button(btn_frm, text="Consultar",
                                         command=self._iniciar_consulta, style="Accent.TButton")
         self.btn_consultar.pack(side="left", padx=2)
-        self.btn_excel = ttk.Button(btn_frm, text="Exportar Excel", command=self._exportar_excel)
-        self.btn_excel.pack(side="left", padx=2)
-        self.btn_csv = ttk.Button(btn_frm, text="Exportar CSV", command=self._exportar_csv)
-        self.btn_csv.pack(side="left", padx=2)
+        self.btn_exportar = ttk.Button(btn_frm, text="Exportar...", command=self._exportar)
+        self.btn_exportar.pack(side="left", padx=2)
         self.btn_limpiar = ttk.Button(btn_frm, text="Limpiar", command=self._limpiar)
         self.btn_limpiar.pack(side="left", padx=2)
         self.btn_cancelar = ttk.Button(btn_frm, text="Cancelar", command=self._cancelar_operacion,
@@ -1184,7 +1192,7 @@ class AppSECOP(Tk):
     # CONSULTA PRINCIPAL
     # -------------------------------------------------------------------------
     def _iniciar_consulta(self):
-        if self._consultando:
+        if self._consultando or self._exportando:
             return
 
         nit_manual = self.entry_nit.get().strip()
@@ -1500,7 +1508,7 @@ class AppSECOP(Tk):
                 self._url_map[item] = fila["url"]
 
     def _cambiar_pagina(self, pagina, forzar=False):
-        if not self._filtros_activos or self._consultando or pagina < 1:
+        if not self._filtros_activos or self._consultando or self._exportando or pagina < 1:
             return
         if pagina == self._pagina_actual and not forzar:
             return
@@ -1624,6 +1632,12 @@ class AppSECOP(Tk):
 
     # ---- cancelacion -------------------------------------------------------
     def _cancelar_operacion(self):
+        if self._exportando:
+            # Solo se cancela la exportacion: la consulta y su pagina siguen validas.
+            # El hilo lo confirma con _exportacion_cancelada() y borra lo escrito.
+            self._cancelar.set()
+            self.lbl_estado.config(text="Cancelando exportacion...")
+            return
         self._consulta_id += 1         # lo que llegue de una consulta en vuelo se descarta
         self._cancelar.set()           # las exportaciones largas revisan este evento
         if self._consultando:
@@ -1708,11 +1722,19 @@ class AppSECOP(Tk):
     # -------------------------------------------------------------------------
     def _set_consultando(self, activo):
         self._consultando = activo
+        self._actualizar_controles()
+
+    def _set_exportando(self, activo):
+        self._exportando = activo
+        self._actualizar_controles()
+
+    def _actualizar_controles(self):
+        """Consulta y exportacion son excluyentes: los controles dependen de ambas."""
+        activo = self._consultando or self._exportando
         state = "disabled" if activo else "normal"
         self.btn_consultar.config(state=state,
-                                  text="Consultando..." if activo else "Consultar")
-        self.btn_excel.config(state=state)
-        self.btn_csv.config(state=state)
+                                  text="Consultando..." if self._consultando else "Consultar")
+        self.btn_exportar.config(state=state)
         self.btn_limpiar.config(state=state)
         self.combo_empresa.config(state="disabled" if activo else "readonly")
         self.combo_entidad.config(state="disabled" if activo else "readonly")
@@ -1730,117 +1752,103 @@ class AppSECOP(Tk):
             self.progress.grid_remove()
 
     # -------------------------------------------------------------------------
-    # EXPORTACION COMPLETA (background thread — descarga TODO)
+    # EXPORTACION: pagina/seleccion desde memoria; "todos" pagina a pagina a disco
     # -------------------------------------------------------------------------
-    def _exportar_excel(self):
-        if not self._filtros_activos:
+    def _exportar(self):
+        if self._consultando or self._exportando:
+            return
+        if not self._filas and not self._filtros_activos:
             messagebox.showwarning("Sin datos", "Realice una consulta primero.")
             return
-        filepath = filedialog.asksaveasfilename(
-            defaultextension=".xlsx",
-            filetypes=[("Excel", "*.xlsx")],
-            initialfile=f"SECOP_{datetime.now():%Y%m%d_%H%M}.xlsx",
-        )
-        if not filepath:
+        total = total_registros(self._conteos) if self._conteos else None
+        previo = self.directorio.preferencia("exportar", {}) if hasattr(self, "directorio") else {}
+        dlg = DialogoExportar(self, COLUMNAS_EXPORTACION, len(self._filas),
+                              len(self.tree.selection()), previo, total_estimado=total)
+        dlg.wait_window()
+        opc = dlg.resultado
+        if not opc:
             return
-        self._set_exportando(True)
-        threading.Thread(
-            target=self._hilo_exportar_excel,
-            args=(filepath,),
-            daemon=True,
-        ).start()
+        if hasattr(self, "directorio"):
+            self.directorio.guardar_preferencia("exportar", opc)
 
-    def _hilo_exportar_excel(self, filepath):
-        filtros = self._filtros_activos
-        try:
-            filas, detalle = self._hilo_exportar_datos(filtros)
-            self.after(0, lambda: self.lbl_estado.config(text="Exportando: escribiendo Excel..."))
-            with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
-                df_resumen = pd.DataFrame(filas)
-                df_resumen.to_excel(writer, sheet_name="Resumen", index=False)
-                for nombre_tab, datos_crudos in detalle.items():
-                    if datos_crudos:
-                        hoja = nombre_tab.replace("/", "-").replace("\\", "-")[:31]
-                        pd.DataFrame(datos_crudos).to_excel(writer, sheet_name=hoja, index=False)
-            self.after(0, lambda: (
-                self._set_exportando(False),
-                self.lbl_estado.config(text=f"Exportacion Excel completada: {len(filas)} registros."),
-                messagebox.showinfo("Exportacion", f"Archivo guardado:\n{filepath}")
-            ))
-        except Exception as e:
-            self.after(0, lambda: (
-                self._set_exportando(False),
-                messagebox.showerror("Error de exportacion", str(e))
-            ))
+        if opc["alcance"] == "todos" and requiere_confirmacion(total):
+            if total is None:
+                msg = ("No se pudo estimar el total de registros; la exportacion completa "
+                       "puede ser muy grande.\n\n¿Continuar?")
+            else:
+                msg = (f"Se exportaran aproximadamente {total:,} registros "
+                       f"(mas de {UMBRAL_CONFIRMACION:,}).\n\n¿Continuar?").replace(",", ".")
+            if not messagebox.askyesno("Confirmar exportacion", msg, parent=self):
+                return
 
-    def _exportar_csv(self):
-        if not self._filtros_activos:
-            messagebox.showwarning("Sin datos", "Realice una consulta primero.")
-            return
-        folder = filedialog.askdirectory()
-        if not folder:
-            return
-        self._set_exportando(True)
-        threading.Thread(
-            target=self._hilo_exportar_csv,
-            args=(folder,),
-            daemon=True,
-        ).start()
-
-    def _hilo_exportar_csv(self, folder):
-        try:
-            filas, detalle = self._hilo_exportar_datos(self._filtros_activos)
-            self.after(0, lambda: self.lbl_estado.config(text="Exportando: escribiendo CSVs..."))
-            ts = f"{datetime.now():%Y%m%d_%H%M}"
-            archivos = []
-
-            fp_resumen = os.path.join(folder, f"SECOP_Resumen_{ts}.csv")
-            pd.DataFrame(filas).to_csv(fp_resumen, index=False, encoding="utf-8-sig")
-            archivos.append(os.path.basename(fp_resumen))
-
-            for nombre_tab, datos_crudos in detalle.items():
-                if datos_crudos:
-                    nombre_archivo = nombre_tab.replace(" ", "_").replace("/", "-")[:40]
-                    fp = os.path.join(folder, f"SECOP_{nombre_archivo}_{ts}.csv")
-                    pd.DataFrame(datos_crudos).to_csv(fp, index=False, encoding="utf-8-sig")
-                    archivos.append(os.path.basename(fp))
-
-            msg = f"{len(archivos)} archivos CSV guardados en:\n{folder}\n\n" + "\n".join(archivos)
-            self.after(0, lambda: (
-                self._set_exportando(False),
-                self.lbl_estado.config(text=f"Exportacion CSV completada: {len(filas)} registros."),
-                messagebox.showinfo("Exportacion", msg)
-            ))
-        except Exception as e:
-            self.after(0, lambda: (
-                self._set_exportando(False),
-                messagebox.showerror("Error de exportacion", str(e))
-            ))
-
-    def _hilo_exportar_datos(self, filtros):
-        """PUENTE TEMPORAL: junta las paginas en memoria hasta que la Tarea 8 exporte a disco."""
-        query_local = SECOPQuery(SECOPClient(self.creds))
-        todas_filas, todo_detalle = [], {}
-        for nombre, nit in filtros["empresas"].items():
-            for filas, detalle in query_local.iterar_paginas(
-                    nombre, nit, filtros["filtros"], page_size=500,
-                    on_progress=lambda msg: self.after(0, lambda m=msg: self.lbl_estado.config(text=m))):
-                todas_filas.extend(filas)
-                for k, v in detalle.items():
-                    todo_detalle.setdefault(k, []).extend(v)
-        return todas_filas, todo_detalle
-
-    def _set_exportando(self, activo):
-        state = "disabled" if activo else "normal"
-        self.btn_excel.config(state=state)
-        self.btn_csv.config(state=state)
-        self.btn_cancelar.config(state="normal" if activo else "disabled")
-        if activo:
-            self.progress.grid()
-            self.progress.start(12)
+        sello = f"{datetime.now():%Y%m%d_%H%M}"
+        fmt = opc["formato"]
+        if fmt == "csv_dataset":
+            destino = filedialog.askdirectory(parent=self)
         else:
-            self.progress.stop()
-            self.progress.grid_remove()
+            ext = {"xlsx": ".xlsx", "csv": ".csv", "json": ".json"}[fmt]
+            destino = filedialog.asksaveasfilename(
+                parent=self, defaultextension=ext, filetypes=[(fmt.upper(), "*" + ext)],
+                initialfile=f"SECOP_{sello}{ext}")
+        if not destino:
+            return
+        titulos = {c[0]: c[1] for c in COLUMNAS_EXPORTACION}
+        self._cancelar.clear()         # el evento es compartido con la cancelacion de consultas
+        self._set_exportando(True)
+        if opc["alcance"] == "todos":
+            threading.Thread(target=self._hilo_exportar,
+                             args=(opc, destino, titulos, sello, self._filtros_activos),
+                             daemon=True).start()
+            return
+        filas = self._filas if opc["alcance"] == "pagina" else self.copiador.filas_seleccionadas()
+        self._escribir_exportacion(opc, iter([(filas, {})]), destino, titulos, sello)
+
+    def _hilo_exportar(self, opc, destino, titulos, sello, filtros):
+        """Descarga pagina a pagina directo a disco (nada se acumula en memoria)."""
+        query = SECOPQuery(SECOPClient(self.creds))
+        errores = []                   # paginas de algun dataset que fallaron: se avisan al final
+
+        def paginas():
+            for nombre, nit in filtros["empresas"].items():
+                yield from query.iterar_paginas(
+                    nombre, nit, filtros["filtros"], page_size=500,
+                    on_progress=lambda m: self.after(0, lambda t=m: self.lbl_estado.config(text=t)),
+                    cancelado=self._cancelar.is_set)
+                errores.extend(query.ultimos_errores)
+        self._escribir_exportacion(opc, paginas(), destino, titulos, sello, errores)
+
+    def _escribir_exportacion(self, opc, paginas, destino, titulos, sello, errores=None):
+        try:
+            archivos, n = exportar_incremental(
+                opc["formato"], opc["columnas"], destino, paginas, titulos,
+                opc.get("delimitador", ","), sello, self._cancelar.is_set)
+        except ExportacionCancelada:
+            self.after(0, self._exportacion_cancelada)
+            return
+        except Exception as e:
+            msg = str(e) or type(e).__name__   # `e` no existe cuando corra el lambda
+            self.after(0, lambda m=msg: self._exportacion_error(m))
+            return
+        self.after(0, lambda: self._exportacion_ok(archivos, n, errores))
+
+    def _exportacion_ok(self, archivos, n, errores=None):
+        self._set_exportando(False)
+        self.lbl_estado.config(text=f"Exportacion completada: {n} registros.")
+        texto = "Archivo(s) guardado(s):\n" + "\n".join(archivos)
+        if errores:
+            texto += (f"\n\nATENCION: se registraron {len(errores)} error(es) durante la descarga; "
+                      "el archivo puede estar incompleto:\n" + "\n".join(errores[:5]))
+            messagebox.showwarning("Exportacion incompleta", texto)
+            return
+        messagebox.showinfo("Exportacion", texto)
+
+    def _exportacion_error(self, mensaje):
+        self._set_exportando(False)
+        messagebox.showerror("Error de exportacion", mensaje)
+
+    def _exportacion_cancelada(self):
+        self._set_exportando(False)
+        self.lbl_estado.config(text="Exportacion cancelada; no se guardo ningun archivo.")
 
     # -------------------------------------------------------------------------
     # LIMPIAR
