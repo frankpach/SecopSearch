@@ -66,7 +66,7 @@ class Directorio:
         if not os.path.exists(self.ruta):
             return
         try:
-            with open(self.ruta, "r", encoding="utf-8") as f:
+            with open(self.ruta, "r", encoding="utf-8-sig") as f:
                 datos = json.load(f)
             if not isinstance(datos, dict):
                 raise ValueError("formato")
@@ -156,23 +156,30 @@ class Directorio:
                 return it
         return None
 
-    def agregar(self, tipo, nombre, nit="", alias="", notas="", etiquetas=None,
-                nombre_resuelto=True):
+    def _agregar_item(self, tipo, nombre, nit="", alias="", notas="", etiquetas=None,
+                      nombre_resuelto=True):
+        """Agrega en memoria (sin guardar). Debe llamarse dentro de `_tx`."""
         nombre = str(nombre or "").strip()
         nit = str(nit or "").strip()
         if not nombre and not nit:
             raise ValueError("Se requiere nombre o NIT.")
         resuelto = bool(nombre) and nombre_resuelto
         nombre = nombre or nit
+        dup = self.buscar_duplicado(tipo, nit, nombre)
+        if dup:
+            raise DuplicadoError(dup)
+        item = {"id": uuid.uuid4().hex, "nombre": nombre, "nit": nit,
+                "alias": str(alias or "").strip(), "notas": str(notas or "").strip(),
+                "etiquetas": _etiquetas(etiquetas), "nombre_resuelto": resuelto,
+                "creado": _ahora(), "ultima_consulta": ""}
+        self._lista(tipo).append(item)
+        return item
+
+    def agregar(self, tipo, nombre, nit="", alias="", notas="", etiquetas=None,
+                nombre_resuelto=True):
         with self._tx():
-            dup = self.buscar_duplicado(tipo, nit, nombre)
-            if dup:
-                raise DuplicadoError(dup)
-            item = {"id": uuid.uuid4().hex, "nombre": nombre, "nit": nit,
-                    "alias": str(alias or "").strip(), "notas": str(notas or "").strip(),
-                    "etiquetas": _etiquetas(etiquetas), "nombre_resuelto": resuelto,
-                    "creado": _ahora(), "ultima_consulta": ""}
-            self._lista(tipo).append(item)
+            item = self._agregar_item(tipo, nombre, nit, alias, notas, etiquetas,
+                                      nombre_resuelto)
         return item
 
     def actualizar(self, tipo, id_, **campos):
@@ -195,7 +202,7 @@ class Directorio:
             if "etiquetas" in campos:
                 nuevo["etiquetas"] = _etiquetas(campos["etiquetas"])
             if "nombre" in campos and "nombre_resuelto" not in campos:
-                nuevo["nombre_resuelto"] = True       # el usuario fijo el nombre
+                nuevo["nombre_resuelto"] = bool(str(campos["nombre"] or "").strip())
             dup = self.buscar_duplicado(tipo, nuevo["nit"], nuevo["nombre"], excluir_id=id_)
             if dup:
                 raise DuplicadoError(dup)
@@ -220,6 +227,8 @@ class Directorio:
             d["etiquetas"] = _etiquetas(d["etiquetas"] + o["etiquetas"])
             if o["notas"] and o["notas"] not in d["notas"]:
                 d["notas"] = (d["notas"] + "\n" + o["notas"]).strip()
+            if not d["nombre_resuelto"] and o["nombre_resuelto"]:
+                d["nombre"], d["nombre_resuelto"] = o["nombre"], True
             if not d["alias"]:
                 d["alias"] = o["alias"]
             if not d["nit"]:
@@ -307,37 +316,40 @@ class Directorio:
 
     # ---- migracion -----------------------------------------------------
     def migrar_historiales(self, rutas_empresas, rutas_entidades):
-        """Importa los JSON antiguos una sola vez. Devuelve (n_empresas, n_entidades)."""
+        """Importa los JSON antiguos una sola vez, todo o nada. Devuelve (n_empresas, n_entidades)."""
         with self._lock:
             if self.datos.get("migrado") or self.datos["empresas"] or self.datos["entidades"]:
                 return (0, 0)
             total = {"empresas": 0, "entidades": 0}
-            for tipo, rutas in (("empresas", rutas_empresas), ("entidades", rutas_entidades)):
-                for ruta in rutas:
-                    if not os.path.exists(ruta):
-                        continue
-                    try:
-                        with open(ruta, "r", encoding="utf-8") as f:
-                            lista = json.load(f)
-                    except (OSError, ValueError):
-                        continue
-                    if not isinstance(lista, list):
-                        continue
-                    for it in lista:
-                        if not isinstance(it, dict) or not it.get("nombre"):
+            leidos = []
+            with self._tx():
+                for tipo, rutas in (("empresas", rutas_empresas), ("entidades", rutas_entidades)):
+                    for ruta in rutas:
+                        if not os.path.exists(ruta):
                             continue
-                        nombre, nit = str(it["nombre"]), str(it.get("nit") or "")
                         try:
-                            nuevo = self.agregar(tipo, nombre, nit,
-                                                 nombre_resuelto=(nombre != nit))
-                        except DuplicadoError:
+                            with open(ruta, "r", encoding="utf-8-sig") as f:
+                                lista = json.load(f)
+                        except (OSError, ValueError):
                             continue
-                        nuevo["ultima_consulta"] = str(it.get("ultima_consulta") or "")
-                        total[tipo] += 1
-                    try:
-                        shutil.copy2(ruta, ruta + ".bak")
-                    except OSError:
-                        pass
-            self.datos["migrado"] = True
-            self.guardar()
+                        if not isinstance(lista, list):
+                            continue
+                        leidos.append(ruta)
+                        for it in lista:
+                            if not isinstance(it, dict) or not it.get("nombre"):
+                                continue
+                            nombre, nit = str(it["nombre"]), str(it.get("nit") or "")
+                            try:
+                                nuevo = self._agregar_item(tipo, nombre, nit,
+                                                           nombre_resuelto=(nombre != nit))
+                            except DuplicadoError:
+                                continue
+                            nuevo["ultima_consulta"] = str(it.get("ultima_consulta") or "")
+                            total[tipo] += 1
+                self.datos["migrado"] = True
+            for ruta in leidos:                      # respaldo solo tras guardar con exito
+                try:
+                    shutil.copy2(ruta, ruta + ".bak")
+                except OSError:
+                    pass
             return total["empresas"], total["entidades"]

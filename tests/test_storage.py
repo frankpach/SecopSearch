@@ -237,3 +237,84 @@ def test_escrituras_concurrentes(tmp_path):
         h.join()
     assert len(d.listar("empresas")) == 20
     assert len(nuevo(tmp_path).listar("empresas")) == 20
+
+
+def _historiales(tmp_path):
+    emp = tmp_path / "empresas_historial.json"
+    ent = tmp_path / "entidades_historial.json"
+    emp.write_text(json.dumps([{"nombre": "A", "nit": "111111111"},
+                               {"nombre": "B", "nit": "222222222"}]), encoding="utf-8")
+    ent.write_text(json.dumps([{"nombre": "Alcaldia X", "nit": "800000001"}]), encoding="utf-8")
+    return emp, ent
+
+
+def test_migracion_fallida_a_mitad_es_todo_o_nada_y_reintenta(tmp_path, monkeypatch):
+    emp, ent = _historiales(tmp_path)
+    d = nuevo(tmp_path)
+    real = os.replace
+    with monkeypatch.context() as m:
+        n = []
+
+        def falla(*a, **k):
+            n.append(1)
+            if len(n) == 1:                       # falla una sola vez
+                raise OSError("boom")
+            real(*a, **k)
+        m.setattr(os, "replace", falla)
+        with pytest.raises(OSError):
+            d.migrar_historiales([str(emp)], [str(ent)])
+    assert d.listar("empresas") == [] and d.listar("entidades") == []
+    assert not d.datos.get("migrado")
+    assert not os.path.exists(d.ruta) or not Directorio(d.ruta).datos.get("migrado")
+    assert d.migrar_historiales([str(emp)], [str(ent)]) == (2, 1)
+    assert len(nuevo(tmp_path).listar("empresas")) == 2
+    assert real is os.replace
+
+
+def test_migracion_exitosa_guarda_una_sola_vez(tmp_path):
+    emp, ent = _historiales(tmp_path)
+    d = nuevo(tmp_path)
+    llamadas = []
+    original = d.guardar
+    d.guardar = lambda: (llamadas.append(1), original())[1]
+    assert d.migrar_historiales([str(emp)], [str(ent)]) == (2, 1)
+    assert len(llamadas) == 1
+
+
+def test_actualizar_nombre_vacio_con_nit_no_marca_resuelto(tmp_path):
+    d = nuevo(tmp_path)
+    e = d.agregar("empresas", "ACME", "900123456")
+    d.actualizar("empresas", e["id"], nombre="")
+    r = d.obtener("empresas", e["id"])
+    assert r["nombre"] == "900123456" and r["nombre_resuelto"] is False
+
+
+def test_fusionar_destino_solo_nit_adopta_nombre_del_origen(tmp_path):
+    d = nuevo(tmp_path)
+    a = d.agregar("empresas", "", "111111111")
+    b = d.agregar("empresas", "ACME SAS", "")
+    res = d.fusionar("empresas", a["id"], b["id"])
+    assert res["nombre"] == "ACME SAS" and res["nombre_resuelto"] is True
+    assert res["nit"] == "111111111"
+
+
+def test_json_con_bom_se_lee(tmp_path):
+    ruta = tmp_path / "d.json"
+    ruta.write_text(json.dumps({"version": 1, "empresas": [], "entidades": [],
+                                "busquedas": []}), encoding="utf-8-sig")
+    assert Directorio(str(ruta)).aviso == ""
+    emp = tmp_path / "e.json"
+    emp.write_text(json.dumps([{"nombre": "A", "nit": "1"}]), encoding="utf-8-sig")
+    assert nuevo(tmp_path).migrar_historiales([str(emp)], []) == (1, 0)
+
+
+def test_guardado_fallido_elimina_el_tmp(tmp_path, monkeypatch):
+    d = nuevo(tmp_path)
+    d.agregar("empresas", "A", "111111111")
+    with monkeypatch.context() as m:
+        def falla(*a, **k):
+            raise OSError("boom")
+        m.setattr(os, "replace", falla)
+        with pytest.raises(OSError):
+            d.agregar("empresas", "B", "222222222")
+    assert not os.path.exists(d.ruta + ".tmp")
