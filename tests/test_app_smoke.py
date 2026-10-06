@@ -119,6 +119,25 @@ def test_ejecutar_busqueda_guardada_restaura_filtros_rango_y_tamano(app, monkeyp
     assert lanzados and lanzados[0][1].estado == "activo"
 
 
+def test_busqueda_guardada_danada_avisa_sin_lanzar_la_consulta(app, monkeypatch):
+    import app_secop
+    lanzados, avisos = [], []
+    monkeypatch.setattr("app_secop.threading.Thread",
+                        lambda target=None, args=(), daemon=None, **k:
+                        type("H", (), {"start": lambda s: lanzados.append(args)})())
+    monkeypatch.setattr("app_secop.messagebox.showwarning", lambda *a, **k: avisos.append(a))
+
+    def desde_dict_roto(d):
+        raise ValueError("dato inesperado")
+    monkeypatch.setattr(app_secop.Filtros, "desde_dict", staticmethod(desde_dict_roto))
+    app.directorio.guardar_busqueda("Rota", {"texto": "x"})
+    app._refrescar_combo_busquedas()
+    app.var_busqueda.set("Rota")
+    app._ejecutar_busqueda_guardada()
+    assert lanzados == [] and app._consultando is False
+    assert len(avisos) == 1 and "danada" in avisos[0][1]
+
+
 def test_filas_nuevas_se_marcan_solo_desde_la_segunda_ejecucion(app):
     fila = {"fuente": "SECOP II", "id_contrato": "C1", "referencia": "", "entidad_nit": "",
             "entidad": "E", "fecha_firma": "2024-01-01"}

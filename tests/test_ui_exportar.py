@@ -251,6 +251,67 @@ def test_error_de_exportacion_se_informa(lista, monkeypatch, tmp_path):
     assert lista._exportando is False
 
 
+def test_todos_sin_filas_porque_fallaron_todos_los_datasets_muestra_los_errores(
+        lista, monkeypatch, tmp_path):
+    import app_secop
+
+    def iterar(self, *a, **k):
+        self.ultimos_errores = ["SECOP II - Contratos: 503 Service Unavailable"]
+        return
+        yield                                              # generador que no produce paginas
+    monkeypatch.setattr(app_secop.SECOPQuery, "iterar_paginas", iterar)
+    destino = str(tmp_path / "todo.csv")
+    opc = {"alcance": "todos", "formato": "csv", "columnas": ["id_contrato"], "delimitador": ","}
+    lista._set_exportando(True)
+    lista._hilo_exportar(opc, destino, {}, "s", lista._filtros_activos)
+    _procesar(lista)
+    assert not os.path.exists(destino) and lista._exportando is False
+    assert len(lista.avisos["error"]) == 1
+    assert "503 Service Unavailable" in lista.avisos["error"][0][1]
+
+
+def test_fallo_al_preparar_la_consulta_de_exportacion_libera_la_ui(lista, monkeypatch, tmp_path):
+    import app_secop
+
+    def cliente_roto(creds):
+        raise RuntimeError("credenciales ilegibles")
+    monkeypatch.setattr(app_secop, "SECOPClient", cliente_roto)
+    opc = {"alcance": "todos", "formato": "csv", "columnas": ["id_contrato"], "delimitador": ","}
+    lista._set_exportando(True)
+    lista._hilo_exportar(opc, str(tmp_path / "todo.csv"), {}, "s", lista._filtros_activos)
+    _procesar(lista)
+    assert lista._exportando is False
+    assert lista.avisos["error"] and "credenciales ilegibles" in lista.avisos["error"][0][1]
+
+
+def test_si_empieza_una_consulta_con_el_dialogo_abierto_no_se_exporta(lista, monkeypatch):
+    import app_secop
+    dlg = _dialogo_con(monkeypatch, {"alcance": "pagina", "formato": "csv",
+                                     "columnas": ["id_contrato"], "delimitador": ","})
+    dlg.wait_window = lambda self: lista._set_consultando(True)   # dialogo no modal
+    monkeypatch.setattr(app_secop.filedialog, "asksaveasfilename",
+                        lambda **k: pytest.fail("no debe pedir destino"))
+    lista._exportar()
+    assert HiloFalso.lanzados == [] and lista._exportando is False
+    assert lista.avisos["info"] == [] and lista.avisos["error"] == []
+
+
+def test_la_confirmacion_usa_el_total_vigente_al_cerrar_el_dialogo(lista, monkeypatch):
+    import app_secop
+    lista._conteos = None                                  # el conteo aun no habia llegado
+    dlg = _dialogo_con(monkeypatch, {"alcance": "todos", "formato": "csv",
+                                     "columnas": ["id_contrato"], "delimitador": ","})
+
+    def llega_el_conteo(self):
+        lista._conteos = {"SECOP II - Contratos": 4000}
+    dlg.wait_window = llega_el_conteo
+    preguntas = []
+    monkeypatch.setattr(app_secop.messagebox, "askyesno",
+                        lambda titulo, msg, **k: preguntas.append(msg) or False)
+    lista._exportar()
+    assert len(preguntas) == 1 and "4.000" in preguntas[0]
+
+
 def test_cancelar_durante_exportacion_no_toca_la_consulta(lista):
     lista._set_exportando(True)
     token = lista._consulta_id

@@ -24,7 +24,6 @@ from tkinter import (
     filedialog, StringVar, scrolledtext, BooleanVar, simpledialog, TclError
 )
 
-import pandas as pd
 import requests
 from search import (
     Filtros, condiciones, orden_dataset, primer_valor_positivo, url_de,
@@ -36,7 +35,7 @@ from storage import Directorio, DuplicadoError
 from ui_directorio import DialogoBuscarEmpresa, VentanaDirectorio, error_guardado
 from paginacion import CachePaginas, TAMANOS_PAGINA, TAMANO_POR_DEFECTO, total_paginas, total_registros
 from copiador_tabla import CopiadorTabla
-from exportar import ExportacionCancelada, exportar, exportar_incremental
+from exportar import ExportacionCancelada, exportar_incremental
 from paginacion import UMBRAL_CONFIRMACION, requiere_confirmacion
 from ui_exportar import DialogoExportar
 from tabla_utils import columnas_union, ordenar_filas, texto_pantalla, valor_visible
@@ -2055,7 +2054,7 @@ class AppSECOP(Tk):
         try:
             filtros = Filtros.desde_dict(b.get("filtros"))
             self._cargar_filtros_en_widgets(filtros, b.get("rango"))
-        except (AttributeError, TypeError):          # datos guardados danados
+        except Exception:                            # datos guardados danados (cualquier forma)
             messagebox.showwarning("Busqueda", f"La busqueda '{b['nombre']}' esta danada.")
             return
         self.var_tamano.set(str(PAGINA_NOVEDADES))   # tamano fijo: comparacion de novedades consistente
@@ -2267,6 +2266,15 @@ class AppSECOP(Tk):
         opc = dlg.resultado
         if not opc:
             return
+        # Si grab_set fallo el dialogo no fue modal: pudo empezar otra operacion o
+        # limpiarse la tabla mientras estaba abierto.
+        if self._consultando or self._exportando:
+            self.lbl_estado.config(text="Hay una operacion en curso; no se exporto.")
+            return
+        if not self._filas and not self._filtros_activos:
+            messagebox.showwarning("Sin datos", "Realice una consulta primero.")
+            return
+        total = total_registros(self._conteos) if self._conteos else None   # pudo llegar el conteo
         try:
             self.directorio.guardar_preferencia("exportar", opc)
         except OSError:                         # solo es una comodidad: se exporta igual
@@ -2306,7 +2314,12 @@ class AppSECOP(Tk):
 
     def _hilo_exportar(self, opc, destino, titulos, sello, filtros):
         """Descarga pagina a pagina directo a disco (nada se acumula en memoria)."""
-        query = SECOPQuery(SECOPClient(self.creds))
+        try:
+            query = SECOPQuery(SECOPClient(self.creds))
+        except Exception as e:         # sin esto la UI quedaria "exportando" para siempre
+            msg = str(e) or type(e).__name__
+            self.after(0, lambda m=msg: self._exportacion_error(m))
+            return
         errores = []                   # paginas de algun dataset que fallaron: se avisan al final
 
         def paginas():
@@ -2328,6 +2341,9 @@ class AppSECOP(Tk):
             return
         except Exception as e:
             msg = str(e) or type(e).__name__   # `e` no existe cuando corra el lambda
+            if errores:                        # p. ej. "No hay filas" porque fallo cada dataset
+                msg += (f"\n\nSe registraron {len(errores)} error(es) durante la descarga:\n"
+                        + "\n".join(errores[:5]))
             self.after(0, lambda m=msg: self._exportacion_error(m))
             return
         self.after(0, lambda: self._exportacion_ok(archivos, n, errores))
