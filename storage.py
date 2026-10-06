@@ -209,6 +209,23 @@ class Directorio:
             item.update(nuevo)
         return item
 
+    def completar_nombre(self, tipo, id_, nit, nombre):
+        """Pone el nombre oficial solo si el registro sigue pendiente y con el mismo NIT.
+        Comprobacion y escritura son atomicas: una busqueda en segundo plano nunca pisa
+        un nombre escrito a mano ni uno de un NIT que cambio mientras se buscaba.
+        Devuelve True si lo escribio."""
+        nombre = str(nombre or "").strip()
+        canon = nit_canonico(nit)
+        if not nombre or not canon:
+            return False
+        with self._lock:
+            item = self.obtener(tipo, id_)
+            if (item is None or item.get("nombre_resuelto", True)
+                    or nit_canonico(item.get("nit")) != canon):
+                return False
+            self.actualizar(tipo, id_, nombre=nombre, nombre_resuelto=True)
+        return True
+
     def eliminar(self, tipo, id_):
         with self._tx():
             item = self.obtener(tipo, id_)

@@ -318,3 +318,20 @@ def test_guardado_fallido_elimina_el_tmp(tmp_path, monkeypatch):
         with pytest.raises(OSError):
             d.agregar("empresas", "B", "222222222")
     assert not os.path.exists(d.ruta + ".tmp")
+
+
+def test_completar_nombre_solo_si_sigue_pendiente_y_con_el_mismo_nit(tmp_path):
+    d = Directorio(str(tmp_path / "d.json"))
+    a = d.agregar("empresas", "", "900123456")
+    assert d.completar_nombre("empresas", a["id"], "900.123.456", "OFICIAL SAS") is True
+    assert d.obtener("empresas", a["id"])["nombre"] == "OFICIAL SAS"
+    assert d.obtener("empresas", a["id"])["nombre_resuelto"] is True
+    # ya resuelto (p. ej. escrito a mano): no se pisa
+    assert d.completar_nombre("empresas", a["id"], "900123456", "OTRO") is False
+    assert d.obtener("empresas", a["id"])["nombre"] == "OFICIAL SAS"
+    # el NIT cambio mientras se buscaba: no se escribe
+    b = d.agregar("empresas", "", "800000001")
+    d.actualizar("empresas", b["id"], nit="800000002", nombre_resuelto=False)
+    assert d.completar_nombre("empresas", b["id"], "800000001", "VIEJO") is False
+    assert d.completar_nombre("empresas", "no-existe", "800000001", "X") is False
+    assert d.completar_nombre("empresas", b["id"], "800000002", "  ") is False

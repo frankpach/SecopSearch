@@ -31,7 +31,7 @@ from search import (
     construir_where as _build_where, escapar_soql as _escape_sql, resolver_nombre_oficial,
 )
 from storage import Directorio, DuplicadoError
-from ui_directorio import DialogoBuscarEmpresa, VentanaDirectorio
+from ui_directorio import DialogoBuscarEmpresa, VentanaDirectorio, error_guardado
 from paginacion import CachePaginas, TAMANOS_PAGINA, TAMANO_POR_DEFECTO, total_paginas, total_registros
 from copiador_tabla import CopiadorTabla
 from exportar import ExportacionCancelada, exportar, exportar_incremental
@@ -546,7 +546,8 @@ class AppSECOP(Tk):
             self.directorio.migrar_historiales(_rutas_historial("empresas_historial.json"),
                                                _rutas_historial("entidades_historial.json"))
         except OSError as e:                    # la app arranca igual; se avisa en el Directorio
-            self.directorio.aviso = f"No se pudo importar el historial antiguo: {e}"
+            self.directorio.aviso = "\n".join(filter(None, [
+                self.directorio.aviso, f"No se pudo importar el historial antiguo: {e}"]))
         self._ids_combo = {"empresas": {}, "entidades": {}}   # {clave del combo: id}
         self._ventana_directorio = None
 
@@ -765,10 +766,10 @@ class AppSECOP(Tk):
         def trabajo():
             try:
                 nombre = resolver_nombre_oficial(self._client_nuevo(), nit)
-                if not nombre:
+                # Solo si sigue pendiente y con el mismo NIT: no pisa un nombre escrito a mano
+                if not self.directorio.completar_nombre("empresas", item_id, nit, nombre):
                     return
-                self.directorio.actualizar("empresas", item_id, nombre=nombre)
-            except (DuplicadoError, KeyError, ValueError, requests.RequestException):
+            except (DuplicadoError, KeyError, ValueError, OSError, requests.RequestException):
                 return
             self._refrescar_combos_desde_hilo()
         threading.Thread(target=trabajo, daemon=True).start()
@@ -780,6 +781,16 @@ class AppSECOP(Tk):
             self.after(0, self._refrescar_combos)
         except (TclError, RuntimeError):            # la app ya se cerro
             pass
+
+    def _seleccionar_en_combo(self, tipo, id_):
+        """Recarga el combo de `tipo` y selecciona el registro `id_` por su clave visible
+        (los nombres repetidos se muestran como "Nombre (NIT)")."""
+        if tipo == "empresas":
+            self._refrescar_combo_empresas()
+        else:
+            self._refrescar_combo_entidades()
+        clave = next((k for k, i in self._ids_combo[tipo].items() if i == id_), "TODAS")
+        (self.var_empresa if tipo == "empresas" else self.var_entidad).set(clave)
 
     def _item_seleccionado(self, tipo):
         var = self.var_empresa if tipo == "empresas" else self.var_entidad
@@ -803,14 +814,14 @@ class AppSECOP(Tk):
         existente = self.directorio.buscar_por_nit("empresas", nit)
         if existente:
             messagebox.showinfo("Existente", f"Empresa '{existente['nombre']}' con NIT {nit} ya esta en el directorio.")
-            self._refrescar_combo_empresas()
-            clave = next((k for k, i in self._ids_combo["empresas"].items() if i == existente["id"]),
-                         existente["nombre"])
-            self.var_empresa.set(clave)
+            self._seleccionar_en_combo("empresas", existente["id"])
             return
-        item = self.directorio.agregar("empresas", "", nit)      # nombre pendiente de resolver
-        self._refrescar_combo_empresas()
-        self.var_empresa.set(item["nombre"])
+        try:
+            item = self.directorio.agregar("empresas", "", nit)  # nombre pendiente de resolver
+        except OSError as e:
+            error_guardado(e)
+            return
+        self._seleccionar_en_combo("empresas", item["id"])
         self.lbl_estado.config(text=f"Empresa {nit} guardada; buscando nombre oficial...")
         self._resolver_nombre_async(item["id"], nit)
 
@@ -824,6 +835,9 @@ class AppSECOP(Tk):
                 self.directorio.eliminar("empresas", item["id"])
             except KeyError:
                 pass
+            except OSError as e:
+                error_guardado(e)
+                return
             self._refrescar_combos()
             self.lbl_estado.config(text=f"Empresa '{item['nombre']}' eliminada del directorio.")
 
@@ -837,11 +851,12 @@ class AppSECOP(Tk):
             item = self.directorio.agregar("entidades", nombre, nit)
         except DuplicadoError as e:
             messagebox.showinfo("Existente", f"Entidad '{e.existente['nombre']}' ya esta en el directorio.")
-            self._refrescar_combo_entidades()
-            self.var_entidad.set(e.existente["nombre"])
+            self._seleccionar_en_combo("entidades", e.existente["id"])
             return
-        self._refrescar_combo_entidades()
-        self.var_entidad.set(item["nombre"])
+        except OSError as e:
+            error_guardado(e)
+            return
+        self._seleccionar_en_combo("entidades", item["id"])
         self.lbl_estado.config(text=f"Entidad '{item['nombre']}' guardada en el directorio.")
 
     def _eliminar_entidad(self):
@@ -854,6 +869,9 @@ class AppSECOP(Tk):
                 self.directorio.eliminar("entidades", item["id"])
             except KeyError:
                 pass
+            except OSError as e:
+                error_guardado(e)
+                return
             self._refrescar_combos()
             self.lbl_estado.config(text=f"Entidad '{item['nombre']}' eliminada del directorio.")
 
@@ -1341,6 +1359,7 @@ class AppSECOP(Tk):
         has_more_global = False
         nuevas_empresas = []
         nuevas_entidades = []
+        consultadas = []                    # [(nit, nombre encontrado)] para el directorio
 
         for nombre, nit in empresas.items():
             f, d, e, has_more = query_local.consultar_pagina(
@@ -1361,7 +1380,7 @@ class AppSECOP(Tk):
                     detalle[tab_nombre] = []
                 detalle[tab_nombre].extend(tab_data)
 
-            # Directorio: marcar consulta y completar el nombre (solo en primera pagina)
+            # Directorio: anotar la empresa consultada (solo en primera pagina)
             if offset == 0 and nit:
                 nombre_a_guardar = None
                 for row in f:
@@ -1370,31 +1389,19 @@ class AppSECOP(Tk):
                         if cand and cand != "—" and cand != nit:
                             nombre_a_guardar = cand
                             break
-                existente = self.directorio.buscar_por_nit("empresas", nit)
-                if existente:
-                    self.directorio.marcar_consulta("empresas", existente["id"])
-                    if nombre_a_guardar and not existente.get("nombre_resuelto", True):
-                        try:
-                            self.directorio.actualizar("empresas", existente["id"], nombre=nombre_a_guardar)
-                        except (DuplicadoError, KeyError):
-                            pass
-                    self._refrescar_combos_desde_hilo()
-                else:
-                    nuevas_empresas.append((nombre_a_guardar or nit, nit))
-
-        # Directorio de entidades (solo en primera pagina)
-        if offset == 0 and (filtros.entidad_nombre or filtros.entidad_nit):
-            ent_nit = filtros.entidad_nit or ""
-            existente = (self.directorio.buscar_por_nit("entidades", ent_nit) if ent_nit else None)                 or next((e for e in self.directorio.listar("entidades")
-                         if e["nombre"].lower() == (filtros.entidad_nombre or "").lower()), None)
-            if existente:
-                self.directorio.marcar_consulta("entidades", existente["id"])
-                self._refrescar_combos_desde_hilo()
-            elif filas and any(row.get("estado") != "SIN CONTRATOS" for row in filas):
-                nuevas_entidades.append((filtros.entidad_nombre or ent_nit, ent_nit))
+                consultadas.append((nit, nombre_a_guardar))
 
         if token != self._consulta_id:
             return
+        # Solo una consulta vigente actualiza el directorio; si el disco falla, los
+        # resultados se muestran igual y se avisa en la barra de estado.
+        aviso_dir = ""
+        if offset == 0:
+            try:
+                nuevas_empresas, nuevas_entidades = self._registrar_consulta_en_directorio(
+                    consultadas, filtros, filas)
+            except OSError as e:
+                aviso_dir = f"No se pudo actualizar el directorio: {e}"
         # Los omitidos viajan con el resultado: el hilo no escribe estado de la UI
         omitidos = list(query_local.omitidos)
 
@@ -1406,7 +1413,45 @@ class AppSECOP(Tk):
             self._mostrar_resultados_pagina(
                 filas, detalle, errores, has_more_global, offset,
                 nuevas_empresas, nuevas_entidades, omitidos)
+            if aviso_dir:
+                self.lbl_estado.config(text=self.lbl_estado.cget("text") + "  |  " + aviso_dir)
         self.after(0, entregar)
+
+    def _registrar_consulta_en_directorio(self, consultadas, filtros, filas):
+        """(Hilo de trabajo) Marca la ultima consulta de los registros existentes, completa
+        nombres pendientes y devuelve (nuevas_empresas, nuevas_entidades) para agregarlas
+        desde la UI. Puede lanzar OSError si el directorio no se puede escribir."""
+        nuevas_empresas, nuevas_entidades = [], []
+        toco = False
+        for nit, nombre_a_guardar in consultadas:
+            existente = self.directorio.buscar_por_nit("empresas", nit)
+            if existente:
+                self.directorio.marcar_consulta("empresas", existente["id"])
+                if nombre_a_guardar:
+                    try:
+                        self.directorio.completar_nombre("empresas", existente["id"], nit,
+                                                         nombre_a_guardar)
+                    except (DuplicadoError, KeyError):
+                        pass
+                toco = True
+            else:
+                nuevas_empresas.append((nombre_a_guardar or nit, nit))
+
+        if filtros.entidad_nombre or filtros.entidad_nit:
+            ent_nit = filtros.entidad_nit or ""
+            existente = self.directorio.buscar_por_nit("entidades", ent_nit) if ent_nit else None
+            if existente is None:
+                nombre_ent = (filtros.entidad_nombre or "").lower()
+                existente = next((e for e in self.directorio.listar("entidades")
+                                  if e["nombre"].lower() == nombre_ent), None)
+            if existente:
+                self.directorio.marcar_consulta("entidades", existente["id"])
+                toco = True
+            elif filas and any(row.get("estado") != "SIN CONTRATOS" for row in filas):
+                nuevas_entidades.append((filtros.entidad_nombre or ent_nit, ent_nit))
+        if toco:
+            self._refrescar_combos_desde_hilo()
+        return nuevas_empresas, nuevas_entidades
 
     def _progreso_consulta(self, msg, token):
         if token == self._consulta_id:
@@ -1421,9 +1466,10 @@ class AppSECOP(Tk):
             self._omitidos = omitidos
         self._tamano_previo = None              # un cambio de tamano ya no se puede deshacer
 
-        # Actualizar historiales
+        # Actualizar el directorio (un fallo de disco no impide mostrar la pagina)
+        aviso_dir = ""
         if nuevas_empresas or nuevas_entidades:
-            self._actualizar_historiales(nuevas_empresas, nuevas_entidades)
+            aviso_dir = self._actualizar_historiales(nuevas_empresas, nuevas_entidades)
 
         # Las ultimas paginas se guardan para revisitarlas sin consultar la API; una pagina
         # con errores puede estar incompleta: no se guarda y se vuelve a pedir al revisitarla
@@ -1450,6 +1496,8 @@ class AppSECOP(Tk):
             msg += f"  |  {len(self._errores)} errores"
         if self._omitidos:
             msg += "  |  Omitidos (filtro no soportado): " + ", ".join(self._omitidos)
+        if aviso_dir:
+            msg += "  |  " + aviso_dir
         self.lbl_estado.config(text=msg)
 
         if errores and offset == 0:
@@ -1458,20 +1506,25 @@ class AppSECOP(Tk):
             self._iniciar_conteo()
 
     def _actualizar_historiales(self, nuevas_empresas, nuevas_entidades):
-        """Agrega empresas/entidades descubiertas al directorio y refresca los combos."""
+        """Agrega empresas/entidades descubiertas al directorio y refresca los combos.
+        Devuelve un aviso (texto) si el directorio no se pudo escribir; si no, ""."""
         n_emp = n_ent = 0
-        for nombre, nit in nuevas_empresas:
-            try:
-                self.directorio.agregar("empresas", nombre, nit, nombre_resuelto=(nombre != nit))
-                n_emp += 1
-            except (DuplicadoError, ValueError):
-                pass
-        for nombre, nit in nuevas_entidades:
-            try:
-                self.directorio.agregar("entidades", nombre, nit)
-                n_ent += 1
-            except (DuplicadoError, ValueError):
-                pass
+        aviso = ""
+        try:
+            for nombre, nit in nuevas_empresas:
+                try:
+                    self.directorio.agregar("empresas", nombre, nit, nombre_resuelto=(nombre != nit))
+                    n_emp += 1
+                except (DuplicadoError, ValueError):
+                    pass
+            for nombre, nit in nuevas_entidades:
+                try:
+                    self.directorio.agregar("entidades", nombre, nit)
+                    n_ent += 1
+                except (DuplicadoError, ValueError):
+                    pass
+        except OSError as e:
+            aviso = f"No se pudo actualizar el directorio: {e}"
         if n_emp or n_ent:
             self._refrescar_combos()
             msgs = []
@@ -1480,6 +1533,7 @@ class AppSECOP(Tk):
             if n_ent:
                 msgs.append(f"{n_ent} entidad(es) agregada(s)")
             self.lbl_estado.config(text="Directorio actualizado: " + ", ".join(msgs))
+        return aviso
 
     @staticmethod
     def _formatear_detalle(col, valor):
@@ -1824,7 +1878,10 @@ class AppSECOP(Tk):
         opc = dlg.resultado
         if not opc:
             return
-        self.directorio.guardar_preferencia("exportar", opc)
+        try:
+            self.directorio.guardar_preferencia("exportar", opc)
+        except OSError:                         # solo es una comodidad: se exporta igual
+            self.lbl_estado.config(text="No se pudo recordar la eleccion de exportacion.")
 
         if opc["alcance"] == "todos" and requiere_confirmacion(total):
             if total is None:

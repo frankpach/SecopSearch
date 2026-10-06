@@ -27,6 +27,11 @@ def _seguro(widget, fn):
         pass
 
 
+def error_guardado(error, parent=None):
+    """Aviso (sin traceback) cuando el directorio no se pudo escribir en disco."""
+    messagebox.showerror("Directorio", f"No se pudo guardar el directorio:\n{error}", parent=parent)
+
+
 class DialogoEdicion(Toplevel):
     def __init__(self, master, titulo, datos, resolver=None):
         super().__init__(master)
@@ -88,6 +93,7 @@ class DialogoEdicion(Toplevel):
         if self.btn_resolver is not None:
             self.btn_resolver.config(state="disabled")
         resolver = self._resolver
+        nombre_previo = self.ent_nombre.get()
 
         def vigente():
             """La respuesta solo sirve si el NIT del dialogo sigue siendo el consultado."""
@@ -96,7 +102,8 @@ class DialogoEdicion(Toplevel):
             return self.ent_nit.get().strip() == nit
 
         def poner(nombre):
-            if vigente():
+            # No pisar un nombre que el usuario escribio mientras se buscaba
+            if vigente() and self.ent_nombre.get() == nombre_previo:
                 self.ent_nombre.delete(0, "end")
                 self.ent_nombre.insert(0, nombre)
 
@@ -215,6 +222,9 @@ class PanelLista(ttk.Frame):
             messagebox.showinfo("Ya existe", f"'{e.existente['nombre']}' ya tiene ese NIT o nombre. "
                                 "Seleccionelo en la lista y use Editar.", parent=self)
             return
+        except OSError as e:
+            error_guardado(e, self)
+            return
         self._tras_cambio()
         if not item["nombre_resuelto"] and self.tipo == "empresas":
             self.ventana._resolver_pendientes()      # solo NIT: buscar el nombre oficial
@@ -228,32 +238,35 @@ class PanelLista(ttk.Frame):
         if item is None:
             self._registro_borrado()
             return
-        d = DialogoEdicion(self.winfo_toplevel(), "Editar", item, resolver=self._resolver())
+        # Copia: `obtener` devuelve el registro vivo, que una busqueda de nombre en segundo
+        # plano puede cambiar mientras el dialogo esta abierto.
+        original = dict(item)
+        d = DialogoEdicion(self.winfo_toplevel(), "Editar", original, resolver=self._resolver())
         d.wait_window()
         if not d.resultado or not _existe(self):
             return
         r = d.resultado
         campos = {"nit": r["nit"], "alias": r["alias"], "etiquetas": r["etiquetas"],
                   "notas": r["notas"]}
-        if r["nombre"] != item["nombre"]:
-            campos["nombre"] = r["nombre"]       # sin cambio: se conserva "nombre pendiente"
+        if r["nombre"] != original["nombre"]:
+            campos["nombre"] = r["nombre"]       # sin cambio: se conserva el nombre actual
         try:
-            self.dir.actualizar(self.tipo, item["id"], **campos)
+            try:
+                self.dir.actualizar(self.tipo, original["id"], **campos)
+            except DuplicadoError as e:
+                if not messagebox.askyesno(
+                        "NIT duplicado",
+                        f"'{e.existente['nombre']}' ya tiene ese NIT.\n"
+                        "¿Fusionar este registro dentro de ese? (se conservan sus datos y se "
+                        "agregan etiquetas y notas de este)", parent=self):
+                    return
+                self.dir.fusionar(self.tipo, e.existente["id"], original["id"])
         except KeyError:
             self._registro_borrado()
             return
-        except DuplicadoError as e:
-            if not messagebox.askyesno(
-                    "NIT duplicado",
-                    f"'{e.existente['nombre']}' ya tiene ese NIT.\n"
-                    "¿Fusionar este registro dentro de ese? (se conservan sus datos y se "
-                    "agregan etiquetas y notas de este)", parent=self):
-                return
-            try:
-                self.dir.fusionar(self.tipo, e.existente["id"], item["id"])
-            except KeyError:
-                self._registro_borrado()
-                return
+        except OSError as e:
+            error_guardado(e, self)
+            return
         self._tras_cambio()
 
     def eliminar(self):
@@ -269,6 +282,9 @@ class PanelLista(ttk.Frame):
                 self.dir.eliminar(self.tipo, id_)
             except KeyError:                     # ya se habia eliminado
                 pass
+            except OSError as e:
+                error_guardado(e, self)
+                break
         self._tras_cambio()
 
     def fusionar(self):
@@ -290,6 +306,9 @@ class PanelLista(ttk.Frame):
         except KeyError:
             self._registro_borrado()
             return
+        except OSError as e:
+            error_guardado(e, self)
+            return
         self._tras_cambio()
 
 
@@ -302,6 +321,7 @@ class VentanaDirectorio(Toplevel):
         self.client_factory = client_factory
         self.al_cambiar = al_cambiar
         self.resolver = lambda nit: resolver_nombre_oficial(client_factory(), nit)
+        self._resolviendo = False        # evita pasadas de _resolver_pendientes solapadas
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill="both", expand=True)
         self.paneles = {}
@@ -329,11 +349,15 @@ class VentanaDirectorio(Toplevel):
             p.refrescar()
 
     def _resolver_pendientes(self):
-        """Reintenta en segundo plano los nombres oficiales de empresas guardadas solo con NIT."""
-        pendientes = [e for e in self.directorio.listar("empresas")
+        """Reintenta en segundo plano los nombres oficiales de empresas guardadas solo con NIT.
+        Una sola pasada a la vez; nunca pisa un nombre escrito a mano mientras se buscaba."""
+        if self._resolviendo:
+            return
+        pendientes = [(e["id"], e["nit"]) for e in self.directorio.listar("empresas")
                       if not e.get("nombre_resuelto", True) and e["nit"]]
         if not pendientes:
             return
+        self._resolviendo = True
         directorio, resolver, al_cambiar = self.directorio, self.resolver, self.al_cambiar
 
         def avisar():
@@ -344,14 +368,15 @@ class VentanaDirectorio(Toplevel):
 
         def trabajo():
             cambio = False
-            for e in pendientes:
-                try:
-                    nombre = resolver(e["nit"])
-                    if nombre:
-                        directorio.actualizar("empresas", e["id"], nombre=nombre)
-                        cambio = True
-                except Exception:
-                    continue
+            try:
+                for id_, nit in pendientes:
+                    try:
+                        cambio = directorio.completar_nombre("empresas", id_, nit,
+                                                             resolver(nit)) or cambio
+                    except Exception:
+                        continue
+            finally:
+                self._resolviendo = False
             if cambio:
                 _seguro(self.master, avisar)
         threading.Thread(target=trabajo, daemon=True).start()
@@ -458,6 +483,9 @@ class DialogoBuscarEmpresa(Toplevel):
                 nuevas += 1
             except (DuplicadoError, ValueError):
                 continue
+            except OSError as e:
+                error_guardado(e, self)
+                break
         self.al_cambiar()
         messagebox.showinfo("Directorio", f"{nuevas} empresa(s) agregada(s) "
                             f"({len(sel) - nuevas} ya existian).", parent=self)
