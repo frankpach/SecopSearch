@@ -12,7 +12,7 @@ Esta herramienta permite realizar debida diligencia automatizada sobre empresas 
 - **Rango de fechas**: por defecto el ultimo año (selector siempre visible, con rangos predefinidos o fechas propias); se aplica a todas las consultas y el pie de la tabla muestra el rango aplicado. Sanciones y SIRI no usan fechas.
 - **Filtros avanzados**: rango de valor, modalidad, estado y departamento (combinables).
 - **Buscar empresa por nombre**: encuentra el NIT en el registro de proveedores (varias palabras).
-- **Busquedas guardadas y novedades**: guarda una consulta con nombre, re-ejecutala y las filas nuevas desde la ultima ejecucion salen resaltadas. Al abrir la app ofrece ejecutarlas todas.
+- **Busquedas guardadas y novedades**: guarda una consulta con nombre, re-ejecutala y las filas nuevas desde la ultima ejecucion salen resaltadas. Al abrir la app ofrece ejecutarlas todas. "Ejecutar todas" registra cada ejecucion al terminarla, aunque usted no haya revisado esos resultados: las novedades de esa pasada ya no se marcaran como nuevas la siguiente vez.
 - **Directorio editable**: empresas y entidades con nombre, NIT, alias, etiquetas y notas; editar, fusionar duplicados y busqueda por texto.
 - **Copia**: seleccion multiple, Ctrl+C (pega en Excel con columnas alineadas), copiar celda, fila, columna, como CSV o JSON; numeros sin formato por defecto.
 - **Paginacion**: paginas de 50/100/200/500 filas por dataset (100 por defecto), total real de registros, ultima pagina e ir a pagina N, cache de las ultimas 5 paginas y boton Cancelar.
@@ -20,9 +20,11 @@ Esta herramienta permite realizar debida diligencia automatizada sobre empresas 
 
 ## Datos y directorio
 
-El directorio se guarda en `%APPDATA%\SecopSearch\directorio.json` (empresas, entidades, busquedas guardadas y preferencias). La primera vez se importan `empresas_historial.json` y `entidades_historial.json` (si existen) y se dejan copias `.bak`; los originales no se borran. Si el archivo se danara, se respalda como `directorio.json.corrupto-<fecha>` y se crea uno nuevo.
+El directorio se guarda en `%APPDATA%\SecopSearch\directorio.json` (empresas, entidades, busquedas guardadas y preferencias). La primera vez se importan `empresas_historial.json` y `entidades_historial.json` (si existen) y se dejan copias `.bak`; los originales no se borran. Si el archivo se danara, se respalda como `directorio.json.corrupto-<fecha>` y se crea uno nuevo. Si no se puede leer (p. ej. bloqueado por otro programa) o no se puede respaldar, la app avisa y no guarda cambios en esa sesion, para no sobrescribirlo; cierre el otro programa y reinicie.
 
-Al filtrar por UNSPSC, modalidad, estado o departamento, los datasets que no tienen esa columna (p. ej. SECOP Integrado no tiene UNSPSC) se omiten y la barra de estado lo indica.
+El servidor MCP (`mcp_secop.py`) sigue usando sus propios `empresas_historial.json` y `entidades_historial.json` y no se sincroniza con este directorio.
+
+Al filtrar por UNSPSC, modalidad, estado o departamento, los datasets que no tienen esa columna (p. ej. SECOP Integrado no tiene UNSPSC) se omiten y la barra de estado lo indica. Los NIT se aceptan con puntos y guion (`900.123.456-7`) y se consultan sin ellos. Si se elige una entidad del directorio que tiene NIT, se filtra solo por ese NIT (su nombre o alias no se usa como criterio). Con el panel "Filtros avanzados" plegado, los filtros que tenga escritos se siguen aplicando: la casilla muestra "Filtros avanzados activos (n)" y el pie de la tabla los lista.
 
 ## Datasets consultados
 

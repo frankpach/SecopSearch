@@ -32,7 +32,7 @@ Que SECOP Search sirva para descubrir oportunidades y hacer debida diligencia si
 ## 3. Búsqueda: `search.py`
 - Objeto `Filtros`: `texto`, `nit_proveedor`, `entidad_nombre`, `entidad_nit`, `unspsc`, `fecha_desde`, `fecha_hasta`, `valor_min`, `valor_max`, `modalidad`, `estado`, `departamento`.
 - Traducción a `$q` y `$where` con el escape de comillas centralizado (`_escape_sql`). Sin red, para poder probarla.
-- **Texto libre:** consulta procesos (`p6dx-8zbt`) y contratos (`jbjy-vk9h`) en paralelo; deduplica por URL del proceso.
+- **Texto libre:** consulta procesos (`p6dx-8zbt`), contratos (`jbjy-vk9h`) y SECOP Integrado (`rpmr-utcd`) en paralelo; no se deduplica (cada dataset se consulta una vez por página, y contratos y procesos son entidades distintas).
 - **Empresa por nombre:** campo y botón Buscar sobre `qmzu-gj57`; lista (nombre, NIT) con "Guardar en directorio".
 - Panel plegable "Filtros avanzados". Se mantiene la regla de al menos un criterio.
 - **Rango de fechas por defecto: último año, en todas las consultas** (incluidas las de NIT de proveedor). El rango por defecto no cuenta como criterio para la regla de al menos uno.
