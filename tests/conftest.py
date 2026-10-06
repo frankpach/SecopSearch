@@ -1,3 +1,4 @@
+import gc
 import os
 import tkinter
 
@@ -43,3 +44,7 @@ def app(monkeypatch, tmp_path):
     a.update()
     yield a
     a.destroy()
+    # Liberar aqui (hilo principal) los objetos Tk ciclicos: si el GC los recogiera luego
+    # desde un hilo de trabajo, Variable.__del__ falla con 'main thread is not in main loop'.
+    del a
+    gc.collect()

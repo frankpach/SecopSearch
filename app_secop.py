@@ -12,7 +12,6 @@ NUEVO:
 
 import os
 import sys
-import json
 import socket
 import subprocess
 import threading
@@ -22,15 +21,17 @@ import concurrent.futures
 from datetime import datetime
 from tkinter import (
     Tk, Frame, Label, Button, Entry, ttk, messagebox,
-    filedialog, StringVar, scrolledtext, BooleanVar, simpledialog
+    filedialog, StringVar, scrolledtext, BooleanVar, simpledialog, TclError
 )
 
 import pandas as pd
 import requests
 from search import (
     Filtros, condiciones, orden_dataset, primer_valor_positivo, url_de,
-    construir_where as _build_where, escapar_soql as _escape_sql,
+    construir_where as _build_where, escapar_soql as _escape_sql, resolver_nombre_oficial,
 )
+from storage import Directorio, DuplicadoError
+from ui_directorio import DialogoBuscarEmpresa, VentanaDirectorio
 from paginacion import CachePaginas, TAMANOS_PAGINA, TAMANO_POR_DEFECTO, total_paginas, total_registros
 from copiador_tabla import CopiadorTabla
 from exportar import ExportacionCancelada, exportar, exportar_incremental
@@ -42,8 +43,6 @@ from tabla_utils import columnas_union, ordenar_filas, texto_pantalla, valor_vis
 # CONFIGURACION
 # =============================================================================
 ENV_FILE = ".env"
-HISTORIAL_FILE = "empresas_historial.json"
-HISTORIAL_ENTIDADES_FILE = "entidades_historial.json"
 
 DATASETS = {
     "jbjy-vk9h": "SECOP II - Contratos",
@@ -66,64 +65,6 @@ ESTADO_COLORES = {
     "liquidado":    ("#f3e5f5", "#7b1fa2"),
     "modificado":   ("#e8f5e9", "#2e7d32"),
 }
-
-# =============================================================================
-# HISTORIAL JSON - EMPRESAS
-# =============================================================================
-
-def cargar_historial():
-    """Carga lista de empresas desde JSON local. Retorna dict {nombre: nit}."""
-    if os.path.exists(HISTORIAL_FILE):
-        try:
-            with open(HISTORIAL_FILE, "r", encoding="utf-8") as f:
-                lista = json.load(f)
-            return {item["nombre"]: item["nit"] for item in lista if "nombre" in item and "nit" in item}
-        except Exception:
-            pass
-    return {}
-
-
-def guardar_historial(empresas_dict):
-    """Guarda dict {nombre: nit} como lista JSON con timestamps."""
-    lista = []
-    for nombre, nit in empresas_dict.items():
-        lista.append({"nombre": nombre, "nit": nit, "ultima_consulta": datetime.now().isoformat()})
-    try:
-        with open(HISTORIAL_FILE, "w", encoding="utf-8") as f:
-            json.dump(lista, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        import sys
-        sys.stderr.write(f"[WARN] No se pudo guardar historial empresas: {e}\n")
-
-
-# =============================================================================
-# HISTORIAL JSON - ENTIDADES
-# =============================================================================
-
-def cargar_historial_entidades():
-    """Carga lista de entidades desde JSON local. Retorna dict {nombre: nit}."""
-    if os.path.exists(HISTORIAL_ENTIDADES_FILE):
-        try:
-            with open(HISTORIAL_ENTIDADES_FILE, "r", encoding="utf-8") as f:
-                lista = json.load(f)
-            return {item["nombre"]: item["nit"] for item in lista if "nombre" in item and "nit" in item}
-        except Exception:
-            pass
-    return {}
-
-
-def guardar_historial_entidades(entidades_dict):
-    """Guarda dict {nombre: nit} como lista JSON con timestamps."""
-    lista = []
-    for nombre, nit in entidades_dict.items():
-        lista.append({"nombre": nombre, "nit": nit, "ultima_consulta": datetime.now().isoformat()})
-    try:
-        with open(HISTORIAL_ENTIDADES_FILE, "w", encoding="utf-8") as f:
-            json.dump(lista, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        import sys
-        sys.stderr.write(f"[WARN] No se pudo guardar historial entidades: {e}\n")
-
 
 # =============================================================================
 # UTILIDADES
@@ -173,6 +114,12 @@ def tag_para_estado(estado):
 def validar_nit(nit):
     digitos = nit.replace("-", "").replace(".", "")
     return digitos.isdigit() and 8 <= len(digitos) <= 11
+
+
+def _rutas_historial(nombre):
+    """Rutas candidatas de los JSON antiguos: cwd, carpeta del programa y datos empaquetados."""
+    bases = [os.getcwd(), os.path.dirname(os.path.abspath(sys.argv[0])), getattr(sys, "_MEIPASS", None)]
+    return [os.path.join(b, nombre) for b in dict.fromkeys(b for b in bases if b)]
 
 
 # =============================================================================
@@ -593,9 +540,15 @@ class AppSECOP(Tk):
         self.client = SECOPClient(self.creds)
         self.query = SECOPQuery(self.client)
 
-        # Cargar historiales
-        self.empresas = cargar_historial()
-        self.entidades = cargar_historial_entidades()
+        # Directorio persistente (migra los JSON antiguos la primera vez)
+        self.directorio = Directorio()
+        try:
+            self.directorio.migrar_historiales(_rutas_historial("empresas_historial.json"),
+                                               _rutas_historial("entidades_historial.json"))
+        except OSError as e:                    # la app arranca igual; se avisa en el Directorio
+            self.directorio.aviso = f"No se pudo importar el historial antiguo: {e}"
+        self._ids_combo = {"empresas": {}, "entidades": {}}   # {clave del combo: id}
+        self._ventana_directorio = None
 
         self._filas = []
         self._url_map = {}
@@ -667,6 +620,7 @@ class AppSECOP(Tk):
         ttk.Label(frm, text="SECOP II — Debida Diligencia", style="Header.TLabel").pack(side="left")
         ttk.Label(frm, text="  Vigilancia y Seguridad Privada | Colombia Compra Eficiente",
                   style="Sub.TLabel").pack(side="left", padx=(6, 0))
+        ttk.Button(frm, text="Directorio...", command=self._abrir_directorio).pack(side="right")
 
     # -------------------------------------------------------------------------
     # PANEL CONTROL
@@ -682,8 +636,10 @@ class AppSECOP(Tk):
                                           state="readonly", width=42)
         self._refrescar_combo_empresas()
         self.combo_empresa.grid(row=0, column=1, sticky="w", padx=(0, 4))
-        ttk.Button(frm, text="Eliminar", width=8,
-                   command=self._eliminar_empresa).grid(row=0, column=2, sticky="w", padx=(0, 12))
+        acc_emp = ttk.Frame(frm)
+        acc_emp.grid(row=0, column=2, sticky="w", padx=(0, 12))
+        ttk.Button(acc_emp, text="Editar", width=7, command=lambda: self._editar_seleccion("empresas")).pack(side="left", padx=1)
+        ttk.Button(acc_emp, text="Eliminar", width=8, command=self._eliminar_empresa).pack(side="left", padx=1)
 
         ttk.Label(frm, text="NIT manual:").grid(row=0, column=3, sticky="w", padx=(0, 4))
         self.entry_nit = ttk.Entry(frm, width=18)
@@ -699,8 +655,10 @@ class AppSECOP(Tk):
         self._refrescar_combo_entidades()
         self.combo_entidad.grid(row=1, column=1, sticky="w", padx=(0, 4), pady=(6, 0))
         self.combo_entidad.bind("<<ComboboxSelected>>", self._on_entidad_selected)
-        ttk.Button(frm, text="Eliminar", width=8,
-                   command=self._eliminar_entidad).grid(row=1, column=2, sticky="w", padx=(0, 12), pady=(6, 0))
+        acc_ent = ttk.Frame(frm)
+        acc_ent.grid(row=1, column=2, sticky="w", padx=(0, 12), pady=(6, 0))
+        ttk.Button(acc_ent, text="Editar", width=7, command=lambda: self._editar_seleccion("entidades")).pack(side="left", padx=1)
+        ttk.Button(acc_ent, text="Eliminar", width=8, command=self._eliminar_entidad).pack(side="left", padx=1)
 
         ttk.Label(frm, text="Entidad NIT:").grid(row=1, column=3, sticky="w", padx=(0, 4), pady=(6, 0))
         self.entry_entidad_nit = ttk.Entry(frm, width=18)
@@ -743,14 +701,97 @@ class AppSECOP(Tk):
         self.progress.grid_remove()
 
     def _refrescar_combo_empresas(self):
-        self.combo_empresa["values"] = ["TODAS"] + list(self.empresas.keys())
+        self._ids_combo["empresas"] = {k: it["id"] for k, it in self.directorio.claves("empresas").items()}
+        self.combo_empresa["values"] = ["TODAS"] + list(self._ids_combo["empresas"])
 
     def _refrescar_combo_entidades(self):
-        self.combo_entidad["values"] = ["TODAS"] + list(self.entidades.keys())
+        self._ids_combo["entidades"] = {k: it["id"] for k, it in self.directorio.claves("entidades").items()}
+        self.combo_entidad["values"] = ["TODAS"] + list(self._ids_combo["entidades"])
 
     # -------------------------------------------------------------------------
-    # GESTION HISTORIAL
+    # DIRECTORIO (storage.Directorio es la unica fuente de verdad)
     # -------------------------------------------------------------------------
+    @property
+    def empresas(self):
+        return self.directorio.nombres_a_nit("empresas")
+
+    @property
+    def entidades(self):
+        return self.directorio.nombres_a_nit("entidades")
+
+    def _client_nuevo(self):
+        return SECOPClient(self.creds)
+
+    def _ventana_directorio_abierta(self):
+        v = self._ventana_directorio
+        try:
+            return v if v is not None and v.winfo_exists() else None
+        except TclError:
+            return None
+
+    def _abrir_directorio(self, tipo="empresas", id_=None):
+        """Abre (o trae al frente) la unica ventana Directorio, en `tipo` y con `id_` seleccionado."""
+        v = self._ventana_directorio_abierta()
+        if v is None:
+            v = self._ventana_directorio = VentanaDirectorio(
+                self, self.directorio, self._client_nuevo, self._refrescar_combos, tipo_inicial=tipo)
+        else:
+            v.deiconify()
+            v.lift()
+        v.mostrar(tipo, id_)
+        return v
+
+    def _refrescar_combos(self):
+        """Recarga los combos desde el directorio. La seleccion sigue al registro (por id)
+        aunque haya cambiado de nombre; si el registro ya no existe vuelve a TODAS."""
+        for tipo, var, refrescar in (("empresas", self.var_empresa, self._refrescar_combo_empresas),
+                                     ("entidades", self.var_entidad, self._refrescar_combo_entidades)):
+            actual = var.get()
+            id_previo = self._ids_combo[tipo].get(actual)
+            refrescar()
+            if actual == "TODAS":
+                continue
+            ids = self._ids_combo[tipo]
+            if id_previo is not None:
+                clave = next((k for k, i in ids.items() if i == id_previo), None)
+            else:
+                clave = actual if actual in ids else None
+            var.set(clave or "TODAS")
+        v = self._ventana_directorio_abierta()
+        if v is not None:
+            v.refrescar()
+
+    def _resolver_nombre_async(self, item_id, nit):
+        def trabajo():
+            try:
+                nombre = resolver_nombre_oficial(self._client_nuevo(), nit)
+                if not nombre:
+                    return
+                self.directorio.actualizar("empresas", item_id, nombre=nombre)
+            except (DuplicadoError, KeyError, ValueError, requests.RequestException):
+                return
+            self._refrescar_combos_desde_hilo()
+        threading.Thread(target=trabajo, daemon=True).start()
+
+    def _refrescar_combos_desde_hilo(self):
+        """Pide al hilo de la UI recargar combos y ventana Directorio tras un cambio hecho
+        desde un hilo de trabajo."""
+        try:
+            self.after(0, self._refrescar_combos)
+        except (TclError, RuntimeError):            # la app ya se cerro
+            pass
+
+    def _item_seleccionado(self, tipo):
+        var = self.var_empresa if tipo == "empresas" else self.var_entidad
+        return self.directorio.claves(tipo).get(var.get())
+
+    def _editar_seleccion(self, tipo):
+        item = self._item_seleccionado(tipo)
+        if not item:
+            messagebox.showwarning("Seleccion", "Seleccione un registro del directorio para editar.")
+            return None
+        return self._abrir_directorio(tipo, item["id"])
+
     def _guardar_empresa_manual(self):
         nit = self.entry_nit.get().strip()
         if not nit:
@@ -759,34 +800,32 @@ class AppSECOP(Tk):
         if not validar_nit(nit):
             messagebox.showwarning("NIT invalido", "El NIT debe tener entre 8 y 11 digitos.")
             return
-        # Si ya existe, solo actualizar; si no, agregar con nombre = nit por ahora
-        nombre = None
-        for n, v in self.empresas.items():
-            if v == nit:
-                nombre = n
-                break
-        if nombre:
-            messagebox.showinfo("Existente", f"Empresa '{nombre}' con NIT {nit} ya esta en el historial.")
-            self.var_empresa.set(nombre)
+        existente = self.directorio.buscar_por_nit("empresas", nit)
+        if existente:
+            messagebox.showinfo("Existente", f"Empresa '{existente['nombre']}' con NIT {nit} ya esta en el directorio.")
+            self._refrescar_combo_empresas()
+            clave = next((k for k, i in self._ids_combo["empresas"].items() if i == existente["id"]),
+                         existente["nombre"])
+            self.var_empresa.set(clave)
             return
-        # Agregar nueva
-        self.empresas[nit] = nit
-        guardar_historial(self.empresas)
+        item = self.directorio.agregar("empresas", "", nit)      # nombre pendiente de resolver
         self._refrescar_combo_empresas()
-        self.var_empresa.set(nit)
-        self.lbl_estado.config(text=f"Empresa {nit} guardada en historial.")
+        self.var_empresa.set(item["nombre"])
+        self.lbl_estado.config(text=f"Empresa {nit} guardada; buscando nombre oficial...")
+        self._resolver_nombre_async(item["id"], nit)
 
     def _eliminar_empresa(self):
-        sel = self.var_empresa.get()
-        if sel == "TODAS" or sel not in self.empresas:
-            messagebox.showwarning("Seleccion", "Seleccione una empresa del historial para eliminar.")
+        item = self._item_seleccionado("empresas")
+        if not item:
+            messagebox.showwarning("Seleccion", "Seleccione una empresa del directorio para eliminar.")
             return
-        if messagebox.askyesno("Confirmar", f"Eliminar '{sel}' del historial?"):
-            del self.empresas[sel]
-            guardar_historial(self.empresas)
-            self._refrescar_combo_empresas()
-            self.var_empresa.set("TODAS")
-            self.lbl_estado.config(text=f"Empresa '{sel}' eliminada del historial.")
+        if messagebox.askyesno("Confirmar", f"Eliminar '{item['nombre']}' del directorio?"):
+            try:
+                self.directorio.eliminar("empresas", item["id"])
+            except KeyError:
+                pass
+            self._refrescar_combos()
+            self.lbl_estado.config(text=f"Empresa '{item['nombre']}' eliminada del directorio.")
 
     def _guardar_entidad_manual(self):
         nit = self.entry_entidad_nit.get().strip()
@@ -794,28 +833,29 @@ class AppSECOP(Tk):
         if not nit and not nombre:
             messagebox.showwarning("Datos vacios", "Ingrese al menos nombre o NIT de la entidad.")
             return
-        key = nombre if nombre else nit
-        if key in self.entidades:
-            messagebox.showinfo("Existente", f"Entidad '{key}' ya esta en el historial.")
-            self.var_entidad.set(key)
+        try:
+            item = self.directorio.agregar("entidades", nombre, nit)
+        except DuplicadoError as e:
+            messagebox.showinfo("Existente", f"Entidad '{e.existente['nombre']}' ya esta en el directorio.")
+            self._refrescar_combo_entidades()
+            self.var_entidad.set(e.existente["nombre"])
             return
-        self.entidades[key] = nit
-        guardar_historial_entidades(self.entidades)
         self._refrescar_combo_entidades()
-        self.var_entidad.set(key)
-        self.lbl_estado.config(text=f"Entidad '{key}' guardada en historial.")
+        self.var_entidad.set(item["nombre"])
+        self.lbl_estado.config(text=f"Entidad '{item['nombre']}' guardada en el directorio.")
 
     def _eliminar_entidad(self):
-        sel = self.var_entidad.get()
-        if sel == "TODAS" or sel not in self.entidades:
-            messagebox.showwarning("Seleccion", "Seleccione una entidad del historial para eliminar.")
+        item = self._item_seleccionado("entidades")
+        if not item:
+            messagebox.showwarning("Seleccion", "Seleccione una entidad del directorio para eliminar.")
             return
-        if messagebox.askyesno("Confirmar", f"Eliminar '{sel}' del historial de entidades?"):
-            del self.entidades[sel]
-            guardar_historial_entidades(self.entidades)
-            self._refrescar_combo_entidades()
-            self.var_entidad.set("TODAS")
-            self.lbl_estado.config(text=f"Entidad '{sel}' eliminada del historial.")
+        if messagebox.askyesno("Confirmar", f"Eliminar '{item['nombre']}' del directorio de entidades?"):
+            try:
+                self.directorio.eliminar("entidades", item["id"])
+            except KeyError:
+                pass
+            self._refrescar_combos()
+            self.lbl_estado.config(text=f"Entidad '{item['nombre']}' eliminada del directorio.")
 
     def _on_entidad_selected(self, event=None):
         sel = self.var_entidad.get()
@@ -1228,15 +1268,25 @@ class AppSECOP(Tk):
             return
 
         # Armar lista de empresas a consultar
+        nit_sel = ""
         if nit_manual:
             empresas = {nit_manual: nit_manual}
         elif empresa_sel != "TODAS":
-            empresas = {empresa_sel: self.empresas[empresa_sel]}
+            nit_sel = self.empresas.get(empresa_sel)
+            if nit_sel is None:                 # ya no esta en el directorio
+                self._refrescar_combos()
+                messagebox.showwarning("Empresa", "La empresa seleccionada ya no esta en el directorio.")
+                return
+            if not nit_sel:
+                messagebox.showwarning("Empresa sin NIT",
+                    f"'{empresa_sel}' no tiene NIT en el directorio. Agreguelo con Editar.")
+                return
+            empresas = {empresa_sel: nit_sel}
         else:
             empresas = {None: None}  # Busqueda general
 
         filtros = Filtros(
-            nit_proveedor=nit_manual or (self.empresas.get(empresa_sel, "") if empresa_sel != "TODAS" else ""),
+            nit_proveedor=nit_manual or nit_sel,
             unspsc=unspsc, entidad_nombre=entidad_nombre, entidad_nit=entidad_nit,
         )
         errs_filtros = filtros.errores()
@@ -1311,7 +1361,7 @@ class AppSECOP(Tk):
                     detalle[tab_nombre] = []
                 detalle[tab_nombre].extend(tab_data)
 
-            # Guardar empresa en historial (solo en primera pagina)
+            # Directorio: marcar consulta y completar el nombre (solo en primera pagina)
             if offset == 0 and nit:
                 nombre_a_guardar = None
                 for row in f:
@@ -1320,18 +1370,28 @@ class AppSECOP(Tk):
                         if cand and cand != "—" and cand != nit:
                             nombre_a_guardar = cand
                             break
-                if not nombre_a_guardar:
-                    nombre_a_guardar = nit
-                if nombre_a_guardar not in self.empresas:
-                    nuevas_empresas.append((nombre_a_guardar, nit))
+                existente = self.directorio.buscar_por_nit("empresas", nit)
+                if existente:
+                    self.directorio.marcar_consulta("empresas", existente["id"])
+                    if nombre_a_guardar and not existente.get("nombre_resuelto", True):
+                        try:
+                            self.directorio.actualizar("empresas", existente["id"], nombre=nombre_a_guardar)
+                        except (DuplicadoError, KeyError):
+                            pass
+                    self._refrescar_combos_desde_hilo()
+                else:
+                    nuevas_empresas.append((nombre_a_guardar or nit, nit))
 
-        # Guardar entidad en historial (solo en primera pagina)
+        # Directorio de entidades (solo en primera pagina)
         if offset == 0 and (filtros.entidad_nombre or filtros.entidad_nit):
-            ent_key = filtros.entidad_nombre if filtros.entidad_nombre else filtros.entidad_nit
-            ent_nit = filtros.entidad_nit if filtros.entidad_nit else ""
-            if ent_key and ent_key not in self.entidades:
-                if filas and any(row.get("estado") != "SIN CONTRATOS" for row in filas):
-                    nuevas_entidades.append((ent_key, ent_nit))
+            ent_nit = filtros.entidad_nit or ""
+            existente = (self.directorio.buscar_por_nit("entidades", ent_nit) if ent_nit else None)                 or next((e for e in self.directorio.listar("entidades")
+                         if e["nombre"].lower() == (filtros.entidad_nombre or "").lower()), None)
+            if existente:
+                self.directorio.marcar_consulta("entidades", existente["id"])
+                self._refrescar_combos_desde_hilo()
+            elif filas and any(row.get("estado") != "SIN CONTRATOS" for row in filas):
+                nuevas_entidades.append((filtros.entidad_nombre or ent_nit, ent_nit))
 
         if token != self._consulta_id:
             return
@@ -1398,32 +1458,28 @@ class AppSECOP(Tk):
             self._iniciar_conteo()
 
     def _actualizar_historiales(self, nuevas_empresas, nuevas_entidades):
-        """Agrega empresas/entidades nuevas al historial y refresca los combos."""
-        cambio = False
+        """Agrega empresas/entidades descubiertas al directorio y refresca los combos."""
+        n_emp = n_ent = 0
         for nombre, nit in nuevas_empresas:
-            if nombre not in self.empresas:
-                self.empresas[nombre] = nit
-                cambio = True
-        if cambio:
-            guardar_historial(self.empresas)
-            self._refrescar_combo_empresas()
-
-        cambio_ent = False
+            try:
+                self.directorio.agregar("empresas", nombre, nit, nombre_resuelto=(nombre != nit))
+                n_emp += 1
+            except (DuplicadoError, ValueError):
+                pass
         for nombre, nit in nuevas_entidades:
-            if nombre not in self.entidades:
-                self.entidades[nombre] = nit
-                cambio_ent = True
-        if cambio_ent:
-            guardar_historial_entidades(self.entidades)
-            self._refrescar_combo_entidades()
-
-        msgs = []
-        if nuevas_empresas:
-            msgs.append(f"{len(nuevas_empresas)} empresa(s) agregada(s)")
-        if nuevas_entidades:
-            msgs.append(f"{len(nuevas_entidades)} entidad(es) agregada(s)")
-        if msgs:
-            self.lbl_estado.config(text="Historial actualizado: " + ", ".join(msgs))
+            try:
+                self.directorio.agregar("entidades", nombre, nit)
+                n_ent += 1
+            except (DuplicadoError, ValueError):
+                pass
+        if n_emp or n_ent:
+            self._refrescar_combos()
+            msgs = []
+            if n_emp:
+                msgs.append(f"{n_emp} empresa(s) agregada(s)")
+            if n_ent:
+                msgs.append(f"{n_ent} entidad(es) agregada(s)")
+            self.lbl_estado.config(text="Directorio actualizado: " + ", ".join(msgs))
 
     @staticmethod
     def _formatear_detalle(col, valor):
@@ -1761,15 +1817,14 @@ class AppSECOP(Tk):
             messagebox.showwarning("Sin datos", "Realice una consulta primero.")
             return
         total = total_registros(self._conteos) if self._conteos else None
-        previo = self.directorio.preferencia("exportar", {}) if hasattr(self, "directorio") else {}
+        previo = self.directorio.preferencia("exportar", {})
         dlg = DialogoExportar(self, COLUMNAS_EXPORTACION, len(self._filas),
                               len(self.tree.selection()), previo, total_estimado=total)
         dlg.wait_window()
         opc = dlg.resultado
         if not opc:
             return
-        if hasattr(self, "directorio"):
-            self.directorio.guardar_preferencia("exportar", opc)
+        self.directorio.guardar_preferencia("exportar", opc)
 
         if opc["alcance"] == "todos" and requiere_confirmacion(total):
             if total is None:
