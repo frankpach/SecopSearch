@@ -1,0 +1,411 @@
+# -*- coding: utf-8 -*-
+"""Directorio persistente de empresas, entidades y busquedas guardadas."""
+import copy
+import json
+import os
+import shutil
+import threading
+import uuid
+from contextlib import contextmanager
+from datetime import datetime
+
+VERSION = 1
+TIPOS = ("empresas", "entidades")
+CAMPOS_EDITABLES = {"nombre", "nit", "alias", "notas", "etiquetas", "nombre_resuelto",
+                    "nombre_auto"}
+MAX_IDS = 2000
+
+
+def directorio_datos():
+    base = os.environ.get("SECOP_DATA_DIR")
+    if not base:
+        raiz = os.environ.get("APPDATA") or os.path.expanduser("~")
+        base = os.path.join(raiz, "SecopSearch")
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def _ahora():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def nit_canonico(nit):
+    return str(nit or "").replace("-", "").replace(".", "").replace(" ", "").strip()
+
+
+def _etiquetas(valor):
+    if isinstance(valor, str):
+        valor = valor.split(",")
+    vistas = []
+    for e in valor or []:
+        e = str(e).strip()
+        if e and e not in vistas:
+            vistas.append(e)
+    return vistas
+
+
+class DuplicadoError(ValueError):
+    def __init__(self, existente):
+        super().__init__(f"Ya existe '{existente['nombre']}' con ese NIT o nombre.")
+        self.existente = existente
+
+
+class DirectorioProtegidoError(OSError):
+    """El archivo del directorio no se pudo leer (o respaldar si estaba danado): no se
+    escribe nada para no sobrescribir los datos del usuario con un directorio vacio."""
+
+
+class Directorio:
+    def __init__(self, ruta=None):
+        self.ruta = ruta or os.path.join(directorio_datos(), "directorio.json")
+        self.aviso = ""
+        self.protegido = False          # True: el archivo en disco no se debe tocar
+        self._lock = threading.RLock()
+        self.datos = self._vacio()
+        self._cargar()
+
+    @staticmethod
+    def _vacio():
+        return {"version": VERSION, "empresas": [], "entidades": [], "busquedas": []}
+
+    # ---- persistencia --------------------------------------------------
+    def _proteger(self, motivo):
+        self.protegido = True
+        self.aviso = (f"{motivo} Para no perder datos, los cambios de esta sesion no se "
+                      f"guardaran. Cierre otros programas que usen {self.ruta} y reinicie la app.")
+
+    def _ruta_respaldo(self):
+        base = f"{self.ruta}.corrupto-{datetime.now():%Y%m%d%H%M%S-%f}"
+        destino, n = base, 1
+        while os.path.exists(destino):
+            destino, n = f"{base}-{n}", n + 1
+        return destino
+
+    def _cargar(self):
+        if not os.path.exists(self.ruta):
+            return
+        try:
+            with open(self.ruta, "r", encoding="utf-8-sig") as f:
+                datos = json.load(f)
+            if not isinstance(datos, dict):
+                raise ValueError("formato")
+            for clave in ("empresas", "entidades", "busquedas"):
+                if not isinstance(datos.setdefault(clave, []), list):
+                    raise ValueError(clave)
+            datos.setdefault("version", VERSION)
+            self.datos = datos
+        except ValueError:                   # contenido danado (JSON invalido o forma rara)
+            destino = self._ruta_respaldo()
+            try:
+                os.replace(self.ruta, destino)
+            except OSError as e:
+                self._proteger(f"El directorio esta danado y no se pudo respaldar ({e}).")
+                return
+            self.aviso = (f"El directorio estaba danado; se respaldo en {destino} "
+                          "y se creo uno nuevo.")
+        except OSError as e:                 # no se pudo LEER: no es corrupcion
+            self._proteger(f"No se pudo leer el directorio ({e}).")
+
+    def guardar(self):
+        if self.protegido:
+            raise DirectorioProtegidoError(
+                "el directorio no se pudo leer al iniciar; no se guarda para no sobrescribirlo")
+        os.makedirs(os.path.dirname(self.ruta) or ".", exist_ok=True)
+        tmp = self.ruta + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.datos, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.ruta)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+
+    @contextmanager
+    def _tx(self):
+        """Bloquea, ejecuta, guarda; si algo falla restaura la memoria."""
+        with self._lock:
+            snap = copy.deepcopy(self.datos)
+            try:
+                yield
+                self.guardar()
+            except BaseException:
+                self.datos = snap
+                raise
+
+    # ---- empresas / entidades -----------------------------------------
+    def _lista(self, tipo):
+        if tipo not in TIPOS:
+            raise ValueError(f"tipo invalido: {tipo}")
+        return self.datos[tipo]
+
+    def listar(self, tipo, filtro=""):
+        with self._lock:
+            items = list(self._lista(tipo))
+        f = filtro.strip().lower()
+        if not f:
+            return items
+
+        def coincide(it):
+            texto = " ".join([it.get("nombre", ""), it.get("nit", ""), it.get("alias", ""),
+                              it.get("notas", ""), " ".join(it.get("etiquetas", []))])
+            return f in texto.lower()
+        return [it for it in items if coincide(it)]
+
+    def obtener(self, tipo, id_):
+        with self._lock:
+            return next((it for it in self._lista(tipo) if it["id"] == id_), None)
+
+    def buscar_por_nit(self, tipo, nit):
+        canon = nit_canonico(nit)
+        if not canon:
+            return None
+        with self._lock:
+            return next((it for it in self._lista(tipo)
+                         if nit_canonico(it.get("nit")) == canon), None)
+
+    def buscar_duplicado(self, tipo, nit, nombre, excluir_id=None):
+        canon = nit_canonico(nit)
+        for it in self._lista(tipo):
+            if it["id"] == excluir_id:
+                continue
+            if canon:
+                if nit_canonico(it.get("nit")) == canon:
+                    return it
+            elif (not nit_canonico(it.get("nit"))
+                  and it["nombre"].strip().lower() == nombre.strip().lower()):
+                return it
+        return None
+
+    def _agregar_item(self, tipo, nombre, nit="", alias="", notas="", etiquetas=None,
+                      nombre_resuelto=True, nombre_auto=False):
+        """Agrega en memoria (sin guardar). Debe llamarse dentro de `_tx`."""
+        nombre = str(nombre or "").strip()
+        nit = str(nit or "").strip()
+        if not nombre and not nit:
+            raise ValueError("Se requiere nombre o NIT.")
+        resuelto = bool(nombre) and nombre_resuelto
+        nombre = nombre or nit
+        dup = self.buscar_duplicado(tipo, nit, nombre)
+        if dup:
+            raise DuplicadoError(dup)
+        item = {"id": uuid.uuid4().hex, "nombre": nombre, "nit": nit,
+                "alias": str(alias or "").strip(), "notas": str(notas or "").strip(),
+                "etiquetas": _etiquetas(etiquetas), "nombre_resuelto": resuelto,
+                "nombre_auto": resuelto and bool(nombre_auto),
+                "creado": _ahora(), "ultima_consulta": ""}
+        self._lista(tipo).append(item)
+        return item
+
+    def agregar(self, tipo, nombre, nit="", alias="", notas="", etiquetas=None,
+                nombre_resuelto=True, nombre_auto=False):
+        """`nombre_auto`: el nombre vino de SECOP (no lo escribio el usuario); si luego
+        se cambia solo el NIT, ese nombre deja de valer y se vuelve a resolver."""
+        with self._tx():
+            item = self._agregar_item(tipo, nombre, nit, alias, notas, etiquetas,
+                                      nombre_resuelto, nombre_auto)
+        return item
+
+    def actualizar(self, tipo, id_, **campos):
+        invalidos = set(campos) - CAMPOS_EDITABLES
+        if invalidos:
+            raise ValueError(f"campos no editables: {sorted(invalidos)}")
+        with self._tx():
+            item = self.obtener(tipo, id_)
+            if item is None:
+                raise KeyError(id_)
+            nuevo = dict(item)
+            nuevo.update(campos)
+            nuevo["nombre"] = str(nuevo.get("nombre") or "").strip()
+            nuevo["nit"] = str(nuevo.get("nit") or "").strip()
+            if not nuevo["nombre"] and not nuevo["nit"]:
+                raise ValueError("Se requiere nombre o NIT.")
+            nuevo["nombre"] = nuevo["nombre"] or nuevo["nit"]
+            for k in ("alias", "notas"):
+                nuevo[k] = str(nuevo.get(k) or "").strip()
+            if "etiquetas" in campos:
+                nuevo["etiquetas"] = _etiquetas(campos["etiquetas"])
+            if "nombre" in campos and "nombre_resuelto" not in campos:
+                nuevo["nombre_resuelto"] = bool(str(campos["nombre"] or "").strip())
+            if "nombre" in campos and "nombre_auto" not in campos:
+                nuevo["nombre_auto"] = False             # escrito a mano
+            # Solo cambio el NIT: un nombre automatico (o pendiente) era el del NIT anterior
+            if ("nombre" not in campos and nuevo["nit"]
+                    and nit_canonico(nuevo["nit"]) != nit_canonico(item.get("nit"))
+                    and (item.get("nombre_auto") or not item.get("nombre_resuelto", True))):
+                nuevo.update(nombre=nuevo["nit"], nombre_resuelto=False, nombre_auto=False)
+            dup = self.buscar_duplicado(tipo, nuevo["nit"], nuevo["nombre"], excluir_id=id_)
+            if dup:
+                raise DuplicadoError(dup)
+            item.update(nuevo)
+        return item
+
+    def completar_nombre(self, tipo, id_, nit, nombre):
+        """Pone el nombre oficial solo si el registro sigue pendiente y con el mismo NIT.
+        Comprobacion y escritura son atomicas: una busqueda en segundo plano nunca pisa
+        un nombre escrito a mano ni uno de un NIT que cambio mientras se buscaba.
+        Devuelve True si lo escribio."""
+        nombre = str(nombre or "").strip()
+        canon = nit_canonico(nit)
+        if not nombre or not canon:
+            return False
+        with self._lock:
+            item = self.obtener(tipo, id_)
+            if (item is None or item.get("nombre_resuelto", True)
+                    or nit_canonico(item.get("nit")) != canon):
+                return False
+            self.actualizar(tipo, id_, nombre=nombre, nombre_resuelto=True, nombre_auto=True)
+        return True
+
+    def eliminar(self, tipo, id_):
+        with self._tx():
+            item = self.obtener(tipo, id_)
+            if item is None:
+                raise KeyError(id_)
+            self._lista(tipo).remove(item)
+
+    def fusionar(self, tipo, id_destino, id_origen):
+        if id_destino == id_origen:
+            raise ValueError("No se puede fusionar un registro consigo mismo.")
+        with self._tx():
+            d = self.obtener(tipo, id_destino)
+            o = self.obtener(tipo, id_origen)
+            if d is None or o is None:
+                raise KeyError("registro inexistente")
+            d["etiquetas"] = _etiquetas(d["etiquetas"] + o["etiquetas"])
+            if o["notas"] and o["notas"] not in d["notas"]:
+                d["notas"] = (d["notas"] + "\n" + o["notas"]).strip()
+            if not d["nombre_resuelto"] and o["nombre_resuelto"]:
+                d["nombre"], d["nombre_resuelto"] = o["nombre"], True
+                d["nombre_auto"] = bool(o.get("nombre_auto"))
+            if not d["alias"]:
+                d["alias"] = o["alias"]
+            if not d["nit"]:
+                d["nit"] = o["nit"]
+            d["ultima_consulta"] = max(d["ultima_consulta"], o["ultima_consulta"])
+            d["creado"] = min(d["creado"], o["creado"])
+            self._lista(tipo).remove(o)
+        return d
+
+    def marcar_consulta(self, tipo, id_):
+        with self._tx():
+            item = self.obtener(tipo, id_)
+            if item is not None:
+                item["ultima_consulta"] = _ahora()
+
+    def claves(self, tipo):
+        """{clave visible en combos: item}. Nombres repetidos se desambiguan con el NIT."""
+        res = {}
+        for it in self.listar(tipo):
+            clave = it["nombre"]
+            if clave in res:
+                clave = f"{clave} ({it['nit'] or it['id'][:6]})"
+            res[clave] = it
+        return res
+
+    def nombres_a_nit(self, tipo):
+        return {k: it["nit"] for k, it in self.claves(tipo).items()}
+
+    # ---- busquedas guardadas ------------------------------------------
+    def guardar_busqueda(self, nombre, filtros, rango=None):
+        """`rango` guarda el MODO de las fechas (no las fechas calculadas): un rango
+        predefinido como {"modo": "ultimo_anio"} se recalcula al ejecutar."""
+        nombre = str(nombre or "").strip()
+        if not nombre:
+            raise ValueError("La busqueda necesita un nombre.")
+        rango = dict(rango) if rango else {"modo": "ultimo_anio"}
+        with self._tx():
+            existente = self.buscar_busqueda_por_nombre(nombre)
+            if existente:
+                existente.update({"filtros": dict(filtros), "rango": rango,
+                                  "ultimos_ids": [], "ultima_ejecucion": ""})
+                return existente
+            item = {"id": uuid.uuid4().hex, "nombre": nombre, "filtros": dict(filtros),
+                    "rango": rango, "ultimos_ids": [], "ultima_ejecucion": "",
+                    "creado": _ahora()}
+            self.datos["busquedas"].append(item)
+        return item
+
+    def listar_busquedas(self):
+        with self._lock:
+            return list(self.datos["busquedas"])
+
+    def obtener_busqueda(self, id_):
+        with self._lock:
+            return next((b for b in self.datos["busquedas"] if b["id"] == id_), None)
+
+    def buscar_busqueda_por_nombre(self, nombre):
+        n = str(nombre or "").strip().lower()
+        with self._lock:
+            return next((b for b in self.datos["busquedas"] if b["nombre"].lower() == n), None)
+
+    def eliminar_busqueda(self, id_):
+        with self._tx():
+            b = self.obtener_busqueda(id_)
+            if b is None:
+                raise KeyError(id_)
+            self.datos["busquedas"].remove(b)
+
+    def registrar_ejecucion(self, id_, ids):
+        with self._tx():
+            b = self.obtener_busqueda(id_)
+            if b is None:
+                raise KeyError(id_)
+            b["ultimos_ids"] = list(ids)[:MAX_IDS]
+            b["ultima_ejecucion"] = _ahora()
+
+    # ---- preferencias --------------------------------------------------
+    def preferencia(self, clave, defecto=None):
+        with self._lock:
+            return copy.deepcopy(self.datos.get("preferencias", {}).get(clave, defecto))
+
+    def guardar_preferencia(self, clave, valor):
+        with self._tx():
+            self.datos.setdefault("preferencias", {})[clave] = valor
+
+    # ---- migracion -----------------------------------------------------
+    def migrar_historiales(self, rutas_empresas, rutas_entidades):
+        """Importa los JSON antiguos una sola vez, todo o nada. Devuelve (n_empresas, n_entidades)."""
+        with self._lock:
+            if (self.protegido or self.datos.get("migrado")
+                    or self.datos["empresas"] or self.datos["entidades"]):
+                return (0, 0)
+            total = {"empresas": 0, "entidades": 0}
+            leidos = []
+            for tipo, rutas in (("empresas", rutas_empresas), ("entidades", rutas_entidades)):
+                for ruta in rutas:
+                    if not os.path.exists(ruta):
+                        continue
+                    try:
+                        with open(ruta, "r", encoding="utf-8-sig") as f:
+                            lista = json.load(f)
+                    except (OSError, ValueError):
+                        continue
+                    if isinstance(lista, list):
+                        leidos.append((tipo, ruta, lista))
+            if not leidos:                       # nada que migrar: no se escribe nada
+                return (0, 0)
+            with self._tx():
+                for tipo, ruta, lista in leidos:
+                    for it in lista:
+                        if not isinstance(it, dict) or not it.get("nombre"):
+                            continue
+                        nombre, nit = str(it["nombre"]), str(it.get("nit") or "")
+                        try:
+                            nuevo = self._agregar_item(tipo, nombre, nit,
+                                                       nombre_resuelto=(nombre != nit))
+                        except DuplicadoError:
+                            continue
+                        nuevo["ultima_consulta"] = str(it.get("ultima_consulta") or "")
+                        total[tipo] += 1
+                self.datos["migrado"] = True
+            for _tipo, ruta, _lista in leidos:       # respaldo solo tras guardar con exito
+                try:
+                    shutil.copy2(ruta, ruta + ".bak")
+                except OSError:
+                    pass
+            return total["empresas"], total["entidades"]
