@@ -15,6 +15,8 @@ Esta herramienta permite realizar debida diligencia automatizada sobre empresas 
 - **Busquedas guardadas y novedades**: guarda una consulta con nombre, re-ejecutala y las filas nuevas desde la ultima ejecucion salen resaltadas. Al abrir la app ofrece ejecutarlas todas. "Ejecutar todas" registra cada ejecucion al terminarla, aunque usted no haya revisado esos resultados: las novedades de esa pasada ya no se marcaran como nuevas la siguiente vez.
 - **Directorio editable**: empresas y entidades con nombre, NIT, alias, etiquetas y notas; editar, fusionar duplicados y busqueda por texto.
 - **Copia**: seleccion multiple, Ctrl+C (pega en Excel con columnas alineadas), copiar celda, fila, columna, como CSV o JSON; numeros sin formato por defecto.
+- **Pestanas de detalle** (datos crudos de cada dataset, p. ej. Contratos SECOP II, Procesos SECOP II, SECOP Integrado): clic en un encabezado ordena por tipo real (numeros, fechas, texto; vacias al final; otro clic invierte), doble clic o clic derecho > "Abrir en SECOP" abre el registro en el navegador (solo enlaces http/https; cursor de mano sobre las filas con enlace), y clic derecho > "Exportar esta tabla..." guarda todas las columnas de la pestana (pagina actual, en el orden en pantalla) como Excel, CSV o JSON segun la extension elegida.
+- **Logo AiutoX**: en el encabezado y como icono de la ventana, la barra de tareas y el ejecutable (`assets/logo.png`, `assets/logo.ico`). Si falta el archivo, la app arranca igual sin logo.
 - **Paginacion**: paginas de 50/100/200/500 filas por dataset (100 por defecto), total real de registros, ultima pagina e ir a pagina N, cache de las ultimas 5 paginas y boton Cancelar.
 - **Exportacion**: dialogo con alcance (pagina actual, filas seleccionadas o todos los resultados), columnas y formato (Excel con formato, CSV unico, CSV por dataset, JSON). "Todos los resultados" escribe directo a disco pagina a pagina (no usa memoria), pide confirmacion si supera 1.000 registros y se puede cancelar sin dejar archivos parciales.
 
@@ -110,7 +112,7 @@ Las siguientes empresas estan precargadas para consulta rapida:
 
 ```
 +-------------------------------------------------------------+
-| SECOP II - Debida Diligencia                [Directorio...] |
+| [logo] SECOP II - Debida Diligencia         [Directorio...] |
 +-------------------------------------------------------------+
 | Consulta                                                    |
 | Empresa: [TODAS ▼]           NIT manual: [________]         |
