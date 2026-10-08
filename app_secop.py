@@ -636,7 +636,7 @@ class AppSECOP(Tk):
             self.lbl_logo = ttk.Label(frm, image=self._logo)
             self.lbl_logo.pack(side="left", padx=(0, 8))
         ttk.Label(frm, text="SECOP II — Debida Diligencia", style="Header.TLabel").pack(side="left")
-        ttk.Label(frm, text="  Vigilancia y Seguridad Privada | Colombia Compra Eficiente",
+        ttk.Label(frm, text="  Colombia Compra Eficiente",
                   style="Sub.TLabel").pack(side="left", padx=(6, 0))
         ttk.Button(frm, text="Directorio...", command=self._abrir_directorio).pack(side="right")
 
