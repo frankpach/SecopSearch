@@ -23,7 +23,11 @@ def aplicar_icono(ventana, png, ico=None, lado=LADO_LOGO_ENCABEZADO):
         icono = tk.PhotoImage(master=ventana, file=png)
         ventana.iconphoto(True, icono)
         factor = max(1, math.ceil(max(icono.width(), icono.height()) / lado))
-        logo = icono.subsample(factor)
+        pequeno = os.path.join(os.path.dirname(png), "logo_%d.png" % lado)
+        try:
+            logo = tk.PhotoImage(master=ventana, file=pequeno)   # pre-escalado y suavizado
+        except (tk.TclError, OSError):
+            logo = icono.subsample(factor)
     except (tk.TclError, OSError):
         return None, None
     if ico and sys.platform == "win32" and os.path.isfile(ico):
