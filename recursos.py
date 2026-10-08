@@ -21,6 +21,7 @@ def aplicar_icono(ventana, png, ico=None, lado=LADO_LOGO_ENCABEZADO):
     referencias para que no las recoja el GC -- o (None, None) si no se pudo cargar."""
     try:
         icono = tk.PhotoImage(master=ventana, file=png)
+        ventana.update_idletasks()      # la ventana debe existir antes de poner el icono
         ventana.iconphoto(True, icono)
         factor = max(1, math.ceil(max(icono.width(), icono.height()) / lado))
         pequeno = os.path.join(os.path.dirname(png), "logo_%d.png" % lado)
@@ -32,7 +33,7 @@ def aplicar_icono(ventana, png, ico=None, lado=LADO_LOGO_ENCABEZADO):
         return None, None
     if ico and sys.platform == "win32" and os.path.isfile(ico):
         try:
-            ventana.iconbitmap(default=ico)    # .ico multi-tamano: nitido en la barra de tareas
+            ventana.iconbitmap(ico)    # por ventana (no 'default'): si no, la barra de titulo muestra el icono generico
         except tk.TclError:
             pass
     return icono, logo

@@ -66,3 +66,16 @@ def test_la_app_arranca_sin_logo(monkeypatch, tmp_path, request):
     a = request.getfixturevalue("app")
     assert a._icono is None and a._logo is None and a.lbl_logo is None
     assert a.tree is not None and a.lbl_estado is not None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="icono de ventana de Windows")
+def test_el_ico_se_aplica_a_la_ventana_y_no_como_icono_por_defecto(app, monkeypatch):
+    """Con iconbitmap(default=...) la barra de titulo mostraba el icono generico."""
+    monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+    llamadas = []
+    original = app.iconbitmap
+    monkeypatch.setattr(app, "iconbitmap",
+                        lambda *a, **k: (llamadas.append((a, k)), original(*a, **k))[1])
+    aplicar_icono(app, ruta_recurso("assets", "logo.png"), ruta_recurso("assets", "logo.ico"))
+    assert llamadas and "default" not in llamadas[0][1]
+    assert llamadas[0][0] and llamadas[0][0][0].endswith("logo.ico")
