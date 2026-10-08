@@ -38,7 +38,9 @@ from copiador_tabla import CopiadorTabla
 from exportar import ExportacionCancelada, exportar_incremental
 from paginacion import UMBRAL_CONFIRMACION, requiere_confirmacion
 from ui_exportar import DialogoExportar
-from tabla_utils import columnas_union, ordenar_filas, texto_pantalla, valor_visible
+from tabla_utils import ordenar_filas, texto_pantalla, valor_visible
+from tabla_detalle import TablaDetalle
+from recursos import aplicar_icono, ruta_recurso
 
 # =============================================================================
 # CONFIGURACION
@@ -539,6 +541,11 @@ class AppSECOP(Tk):
         self.geometry("1550x950")
         self.configure(bg="#f0f2f5")
         self.minsize(1200, 700)
+        # Logo AiutoX (ventana, barra de tareas y encabezado); sin el archivo la app arranca igual.
+        # Se guardan las referencias: un PhotoImage sin referencia lo recoge el GC.
+        self._icono, self._logo = aplicar_icono(self, ruta_recurso("assets", "logo.png"),
+                                                ruta_recurso("assets", "logo.ico"))
+        self.lbl_logo = None
 
         self.creds = leer_env()
         self.client = SECOPClient(self.creds)
@@ -625,6 +632,9 @@ class AppSECOP(Tk):
     def _crear_header(self):
         frm = ttk.Frame(self, padding=(12, 8))
         frm.pack(fill="x")
+        if self._logo is not None:
+            self.lbl_logo = ttk.Label(frm, image=self._logo)
+            self.lbl_logo.pack(side="left", padx=(0, 8))
         ttk.Label(frm, text="SECOP II — Debida Diligencia", style="Header.TLabel").pack(side="left")
         ttk.Label(frm, text="  Vigilancia y Seguridad Privada | Colombia Compra Eficiente",
                   style="Sub.TLabel").pack(side="left", padx=(6, 0))
@@ -1122,6 +1132,7 @@ class AppSECOP(Tk):
         self._construir_tabla_resumen(self._tab_resumen)
 
         self._tabs_detalle = {}
+        self._tablas_detalle = {}      # {nombre de pestana: TablaDetalle}
 
     def _construir_tabla_resumen(self, parent):
         self.tree = ttk.Treeview(parent, columns=COLS_IDS, show="headings", selectmode="extended")
@@ -1787,49 +1798,14 @@ class AppSECOP(Tk):
         return v
 
     def _construir_tab_detalle(self, parent, nombre, data):
-        """Crea un Treeview con todas las columnas del dataset crudo."""
+        """Tabla con todas las columnas del dataset crudo: ordenar, abrir en SECOP,
+        copiar y exportar (ver tabla_detalle.TablaDetalle)."""
         if not data:
             ttk.Label(parent, text="Sin datos.", style="Meta.TLabel").pack(padx=10, pady=10)
             return
-
-        # Columnas: privadas (_empresa, _nit) al final; las demas primero.
-        # Union de claves porque Socrata omite las columnas nulas.
-        todas = columnas_union(data)
-        cols = [c for c in todas if not c.startswith("_")] + [c for c in todas if c.startswith("_")]
-        titulos = [c.replace("_", " ").strip().title() for c in cols]
-
-        tree = ttk.Treeview(parent, columns=cols, show="headings", selectmode="extended")
-        for c, titulo in zip(cols, titulos):
-            tree.heading(c, text=titulo)
-            tree.column(c, width=130, anchor="w", minwidth=60)
-
-        sy = ttk.Scrollbar(parent, orient="vertical",   command=tree.yview)
-        sx = ttk.Scrollbar(parent, orient="horizontal", command=tree.xview)
-        tree.configure(yscrollcommand=sy.set, xscrollcommand=sx.set)
-
-        tree.grid(row=0, column=0, sticky="nsew")
-        sy.grid(row=0, column=1, sticky="ns")
-        sx.grid(row=1, column=0, sticky="ew")
-        parent.rowconfigure(0, weight=1)
-        parent.columnconfigure(0, weight=1)
-
-        tree.tag_configure("par",   background="#f7f9fc")
-        tree.tag_configure("impar", background="white")
-
-        filas_por_item = {}
-        for i, row in enumerate(data):
-            fila = {c: self._formatear_detalle(c, row.get(c)) for c in cols}
-            vals = [texto_pantalla(fila[c], 120) for c in cols]
-            tag = "par" if i % 2 == 0 else "impar"
-            item = tree.insert("", "end", values=vals, tags=(tag,))
-            filas_por_item[item] = fila
-
-        CopiadorTabla(self, tree, cols, titulos, lambda: filas_por_item,
-                      lambda msg: self.lbl_estado.config(text=msg)).instalar()
-
-        ttk.Label(parent,
-                  text=f"{len(data)} registros  |  datos crudos del dataset  |  Ctrl+C copia la seleccion",
-                  style="Meta.TLabel").grid(row=2, column=0, sticky="w", pady=(2, 0))
+        self._tablas_detalle[nombre] = TablaDetalle(
+            self, parent, nombre, data, self._formatear_detalle,
+            lambda msg: self.lbl_estado.config(text=msg))
 
     def _renderizar_tabla_lazy(self, filas, offset):
         """Renderiza SOLO la pagina actual."""
@@ -1970,6 +1946,7 @@ class AppSECOP(Tk):
             self.notebook.forget(frm)
             frm.destroy()              # forget() solo oculta: sin destroy() quedan en memoria
         self._tabs_detalle.clear()
+        self._tablas_detalle.clear()
 
     def _reconstruir_tabs_detalle(self, detalle):
         seleccionada = self.notebook.select()

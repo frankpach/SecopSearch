@@ -5,7 +5,7 @@ a = Analysis(
     ['app_secop.py'],
     pathex=[],
     binaries=[],
-    datas=[('.env', '.'), ('empresas_historial.json', '.'), ('entidades_historial.json', '.')],
+    datas=[('.env', '.'), ('empresas_historial.json', '.'), ('entidades_historial.json', '.'), ('assets', 'assets')],
     hiddenimports=['pandas', 'openpyxl', 'requests'],
     hookspath=[],
     hooksconfig={},
@@ -35,4 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='assets/logo.ico',
 )

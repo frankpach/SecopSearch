@@ -175,8 +175,9 @@ def _ruta_csv(carpeta, nombre, sello, creados):
 
 
 def exportar_incremental(formato, columnas, destino, paginas, titulos=None,
-                         delimitador=",", sello="", cancelado=None):
+                         delimitador=",", sello="", cancelado=None, hoja="Resumen"):
     """Escribe `paginas` (iterable de (filas, detalle)) sin materializarlas.
+    `hoja`: nombre de la hoja (xlsx) o del archivo (csv_dataset) de las filas principales.
     Devuelve (rutas creadas, n_filas_del_resumen)."""
     if not columnas:
         raise ValueError("Seleccione al menos una columna.")
@@ -206,8 +207,8 @@ def exportar_incremental(formato, columnas, destino, paginas, titulos=None,
             partes.append(parte)
             wb = Workbook(write_only=True)
             usados = set()
-            _hoja_xlsx(wb, nombre_hoja("Resumen", usados), columnas, enc, resumen.filas(),
-                       "url" if "url" in columnas else None, cancelado)
+            _hoja_xlsx(wb, nombre_hoja(hoja, usados), columnas, enc, resumen.filas(),
+                       _col_url(columnas), cancelado)
             for nombre, sp in detalles.items():
                 cols = list(sp.columnas)
                 _hoja_xlsx(wb, nombre_hoja(nombre, usados), cols, cols, sp.filas(),
@@ -225,7 +226,7 @@ def exportar_incremental(formato, columnas, destino, paginas, titulos=None,
             os.replace(parte, destino)
             finales.append(destino)
         else:  # csv_dataset: `destino` es una carpeta
-            trabajos = [("Resumen", columnas, enc, resumen)]
+            trabajos = [(hoja, columnas, enc, resumen)]
             trabajos += [(n, list(sp.columnas), list(sp.columnas), sp)
                          for n, sp in detalles.items()]
             for nombre, cols, encs, sp in trabajos:
@@ -255,9 +256,9 @@ def exportar_incremental(formato, columnas, destino, paginas, titulos=None,
 
 
 def exportar(formato, columnas, filas, destino, titulos=None, detalle=None,
-             delimitador=",", sello=""):
+             delimitador=",", sello="", hoja="Resumen"):
     """Atajo para datos ya en memoria (una sola pagina)."""
     archivos, _ = exportar_incremental(formato, columnas, destino,
                                        iter([(filas, detalle or {})]), titulos,
-                                       delimitador, sello)
+                                       delimitador, sello, hoja=hoja)
     return archivos
