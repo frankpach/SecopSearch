@@ -41,6 +41,31 @@ Configuracion Claude Desktop (SSE HTTPS):
 
 import sys
 
+
+class _StreamNulo:
+    """Destino que descarta todo. No se usa os.devnull: en Windows 'nul' reporta isatty() True."""
+
+    encoding = "utf-8"
+
+    def write(self, texto):
+        return len(texto)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+
+def _asegurar_streams():
+    """El exe sin consola (console=False) arranca con sys.stdout/sys.stderr = None y
+    uvicorn falla al configurar sus logs ('NoneType' object has no attribute 'isatty').
+    Se reemplazan por un destino nulo; los que ya existen no se tocan."""
+    for nombre in ("stdout", "stderr"):
+        if getattr(sys, nombre) is None:
+            setattr(sys, nombre, _StreamNulo())
+
+
 def run_gui():
     """Lanza la aplicacion de escritorio (tkinter)."""
     import app_secop
@@ -57,6 +82,7 @@ def run_mcp():
 
 def run_mcp_sse(port: int = 8000):
     """Lanza el servidor MCP para comunicacion con LLMs via SSE (HTTP)."""
+    _asegurar_streams()
     import mcp_secop
     mcp_secop.mcp.settings.port = port
     mcp_secop.mcp.settings.host = "127.0.0.1"
@@ -65,6 +91,7 @@ def run_mcp_sse(port: int = 8000):
 
 def run_mcp_sse_ssl(port: int, crt_path: str, key_path: str):
     """Lanza el servidor MCP para comunicacion con LLMs via SSE (HTTPS)."""
+    _asegurar_streams()
     import anyio
     import uvicorn
     import mcp_secop
